@@ -1,0 +1,447 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CAN SLIM 종목 분석기 진행 요약</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #05070a;
+      --panel: #0c1117;
+      --panel-2: #111922;
+      --line: #26313f;
+      --text: #f6f8fb;
+      --muted: #98a6b8;
+      --blue: #3b9eff;
+      --green: #16d07f;
+      --amber: #ffca16;
+      --red: #ff5d73;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 18% 0%, rgba(59, 158, 255, .14), transparent 32%),
+        radial-gradient(circle at 82% 12%, rgba(22, 208, 127, .10), transparent 28%),
+        var(--bg);
+      color: var(--text);
+      font-family: Pretendard, "Segoe UI", Arial, sans-serif;
+      line-height: 1.55;
+    }
+
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 42px 0 72px;
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 24px;
+      align-items: end;
+      padding: 26px 0 28px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      color: var(--green);
+      font-weight: 900;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+      font-size: 12px;
+    }
+
+    h1 {
+      margin: 8px 0 12px;
+      font-size: clamp(34px, 6vw, 72px);
+      line-height: .98;
+      letter-spacing: 0;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 24px;
+    }
+
+    p { color: var(--muted); margin: 0; }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 36px;
+      padding: 0 14px;
+      border: 1px solid rgba(22, 208, 127, .42);
+      border-radius: 999px;
+      color: var(--green);
+      background: rgba(22, 208, 127, .08);
+      font-weight: 900;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin: 28px 0;
+    }
+
+    .card,
+    section {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: linear-gradient(180deg, rgba(255,255,255,.055), rgba(255,255,255,.018));
+      box-shadow: 0 18px 48px rgba(0, 0, 0, .24);
+    }
+
+    .card {
+      padding: 18px;
+      min-height: 132px;
+    }
+
+    .card span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .card strong {
+      display: block;
+      margin-top: 10px;
+      font-size: 30px;
+      line-height: 1;
+    }
+
+    section {
+      margin-top: 18px;
+      padding: 24px;
+    }
+
+    ul, ol {
+      margin: 12px 0 0;
+      padding-left: 20px;
+      color: var(--muted);
+    }
+
+    li + li { margin-top: 8px; }
+
+    .timeline {
+      display: grid;
+      gap: 12px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 96px minmax(0, 1fr);
+      gap: 16px;
+      padding: 14px;
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 14px;
+      background: rgba(255,255,255,.035);
+    }
+
+    .step b {
+      color: var(--blue);
+      font-size: 13px;
+    }
+
+    .step strong {
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .checks {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    .check {
+      padding: 14px;
+      border-radius: 12px;
+      background: rgba(22, 208, 127, .08);
+      color: var(--green);
+      font-weight: 900;
+    }
+
+    .warn {
+      background: rgba(255, 202, 22, .08);
+      color: var(--amber);
+    }
+
+    .danger {
+      background: rgba(255, 93, 115, .08);
+      color: var(--red);
+    }
+
+    code {
+      color: var(--green);
+      background: rgba(255,255,255,.08);
+      border-radius: 6px;
+      padding: 2px 6px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 14px;
+      overflow: hidden;
+      border-radius: 12px;
+    }
+
+    th, td {
+      padding: 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      color: var(--muted);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--text);
+      background: rgba(255,255,255,.05);
+    }
+
+    a { color: var(--blue); }
+
+    @media (max-width: 860px) {
+      header,
+      .grid,
+      .checks,
+      .step {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <div class="eyebrow">Project Summary · 2026-05-22</div>
+        <h1>CAN SLIM 종목 분석기 진행 요약</h1>
+        <p>레퍼런스 사이트를 기반으로 실데이터 스캐너, 상세 팝업, 엔트리 점수, 포트폴리오 리스크 관리까지 확장한 현재 상태를 정리했습니다.</p>
+      </div>
+      <span class="status-pill">현재 상태: 실행 가능</span>
+    </header>
+
+    <div class="grid">
+      <article class="card">
+        <span>데이터 연결</span>
+        <strong>FMP · Alpha · DART</strong>
+        <p>무료 API와 캐시 기반으로 가격, 재무, 뉴스, 공시를 보강합니다.</p>
+      </article>
+      <article class="card">
+        <span>점수 체계</span>
+        <strong>Total + Entry</strong>
+        <p>좋은 종목과 좋은 진입 타이밍을 분리해서 봅니다.</p>
+      </article>
+      <article class="card">
+        <span>리스크 엔진</span>
+        <strong>ATR · R:R · Heat</strong>
+        <p>손절 기준 오픈 리스크와 포트폴리오 과열도를 계산합니다.</p>
+      </article>
+      <article class="card">
+        <span>검증 상태</span>
+        <strong>11/11 통과</strong>
+        <p>서버 계약 테스트와 브라우저 스모크 검증을 통과했습니다.</p>
+      </article>
+    </div>
+
+    <section>
+      <h2>완료된 주요 작업</h2>
+      <div class="timeline">
+        <div class="step">
+          <b>STEP 1</b>
+          <div>
+            <strong>레퍼런스 UI 구현</strong>
+            <p>섹터 사이드바, 종목 요약 테이블, 상세 팝업, CAN SLIM/기술/재무/인사이트 탭을 구성했습니다.</p>
+          </div>
+        </div>
+        <div class="step">
+          <b>STEP 2</b>
+          <div>
+            <strong>실데이터 연결</strong>
+            <p>FMP, Alpha Vantage, Yahoo/Naver 가격 캐시, DART/SEC 링크를 연결하고 데이터 신뢰도 상태를 표시했습니다.</p>
+          </div>
+        </div>
+        <div class="step">
+          <b>STEP 3</b>
+          <div>
+            <strong>점수 계산식 정렬</strong>
+            <p>캡처된 CAN SLIM, 퀀트, 수학 지표의 raw score, normalized score, contribution 구조를 맞췄습니다.</p>
+          </div>
+        </div>
+        <div class="step">
+          <b>STEP 4</b>
+          <div>
+            <strong>엔트리 스코어 고도화</strong>
+            <p>단순 점수 대신 상승추세, RSI 눌림, VWAP, 돌파 거래량, 변동성, 추격 위험을 함께 보는 EntryScore v2를 적용했습니다.</p>
+          </div>
+        </div>
+        <div class="step">
+          <b>STEP 5</b>
+          <div>
+            <strong>트레이딩 스킬 반영</strong>
+            <p>position sizing, breakout planning, VCP gate 개념을 적용해 권장 수량, 손절폭, R:R, 피벗 상태를 표시했습니다.</p>
+          </div>
+        </div>
+        <div class="step">
+          <b>STEP 6</b>
+          <div>
+            <strong>포트폴리오 관리 기능</strong>
+            <p>보유 종목 추가/수정/삭제, 현재가 평가, 손익, 손절 기준 오픈 리스크, Heat, 섹터 집중도, CSV 내보내기/불러오기를 추가했습니다.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>현재 포트폴리오 기능</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>기능</th>
+            <th>상태</th>
+            <th>설명</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>보유 종목 추가/수정/삭제</td>
+            <td>완료</td>
+            <td>티커, 수량, 평균단가를 입력하고 브라우저 로컬 저장소에 저장합니다.</td>
+          </tr>
+          <tr>
+            <td>현재가 평가</td>
+            <td>완료</td>
+            <td>기존 <code>/api/stocks/:ticker</code> 상세 데이터를 재사용합니다.</td>
+          </tr>
+          <tr>
+            <td>오픈 리스크</td>
+            <td>완료</td>
+            <td>현재가와 서버 계산 손절가 차이를 기준으로 예상 손실을 계산합니다.</td>
+          </tr>
+          <tr>
+            <td>포트폴리오 Heat</td>
+            <td>완료</td>
+            <td>통화별 오픈 리스크를 계좌 규모 대비 비율로 표시합니다.</td>
+          </tr>
+          <tr>
+            <td>섹터 집중도</td>
+            <td>완료</td>
+            <td>평가금액 기준 가장 큰 섹터 비중을 보여줍니다.</td>
+          </tr>
+          <tr>
+            <td>CSV 내보내기/불러오기</td>
+            <td>완료</td>
+            <td><code>accountSize</code>, <code>ticker</code>, <code>shares</code>, <code>avgCost</code> 형식입니다.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>검증 결과</h2>
+      <div class="checks">
+        <div class="check">node --check app.js 통과</div>
+        <div class="check">node --check server.mjs 통과</div>
+        <div class="check">server-contract 11/11 통과</div>
+      </div>
+      <ul>
+        <li>브라우저에서 한글 깨짐 여부 확인: 깨진 문자열 없음.</li>
+        <li>AAPL 5주, 평균단가 250, 계좌 20,000달러 입력 검증 완료.</li>
+        <li>평가금액 $1,511.25, 오픈 리스크 $84.50, Heat USD 0.42%, 섹터 집중도 100.0% 표시 확인.</li>
+        <li>수정 버튼 입력값 복원, 삭제 후 빈 상태 복귀 확인.</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>추가 개선 완료</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>개선안</th>
+            <th>현재 상태</th>
+            <th>확인 내용</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>포트폴리오 상단 접근</td>
+            <td>완료</td>
+            <td>헤더에 포트폴리오 바로가기 버튼을 추가했습니다.</td>
+          </tr>
+          <tr>
+            <td>JSON 백업/복원</td>
+            <td>완료</td>
+            <td>CSV와 별도로 전체 포트폴리오, 환율, 히스토리를 JSON으로 저장/복원할 수 있습니다.</td>
+          </tr>
+          <tr>
+            <td>실시간 환율 환산</td>
+            <td>완료</td>
+            <td>무키 무료 API로 USD/KRW를 불러오고, 실패 시 대체값으로 표시합니다.</td>
+          </tr>
+          <tr>
+            <td>보유 종목 재스캔</td>
+            <td>완료</td>
+            <td>보유 종목만 다시 조회해 가격, TotalScore, EntryScore, 손절가 스냅샷을 저장합니다.</td>
+          </tr>
+          <tr>
+            <td>변화 알림</td>
+            <td>완료</td>
+            <td>Heat, 손절 접근, EntryScore 주의/추격, 공시/뉴스 신호, 점수 변화 알림을 표시합니다.</td>
+          </tr>
+          <tr>
+            <td>자동 포트 실행</td>
+            <td>완료</td>
+            <td><code>start_app.cmd</code>가 5050~5060 중 빈 포트를 찾아 서버를 열도록 정리했습니다.</td>
+          </tr>
+          <tr>
+            <td>히스토리 시각화</td>
+            <td>완료</td>
+            <td>보유 종목 재스캔 기록을 기반으로 TotalScore와 EntryScore 변화선을 표시합니다.</td>
+          </tr>
+          <tr>
+            <td>상단/행 알림</td>
+            <td>완료</td>
+            <td>포트폴리오 핵심 경고를 상단 배너와 각 종목 행의 알림 뱃지로 함께 보여줍니다.</td>
+          </tr>
+          <tr>
+            <td>Supabase 백업</td>
+            <td>1차 완료</td>
+            <td>서버 API를 통해 포트폴리오 JSON을 Supabase에 저장/불러오는 구조를 추가했습니다.</td>
+          </tr>
+          <tr>
+            <td>Vercel 배포 구조</td>
+            <td>1차 완료</td>
+            <td><code>api/[...path].mjs</code>, <code>package.json</code>, <code>vercel.json</code>을 추가해 서버리스 API 배포 기반을 만들었습니다.</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>다음 후보</h2>
+      <ol>
+        <li>Supabase 프로젝트 생성 후 <code>supabase/schema.sql</code> 실행, 환경변수 연결을 완료합니다.</li>
+        <li>Vercel 프로젝트에 환경변수를 등록하고 배포 스모크 테스트를 진행합니다.</li>
+        <li>그 다음 백테스트 검증표와 뉴스/공시 감성 고도화를 진행합니다.</li>
+      </ol>
+    </section>
+
+    <section>
+      <h2>실행 방법</h2>
+      <p>프로젝트 폴더에서 아래 파일을 실행한 뒤 브라우저에서 접속합니다.</p>
+      <ul>
+        <li><code>C:\Users\korea\Desktop\clude\종목 분석기\start_app.cmd</code></li>
+        <li>기본은 <code>http://127.0.0.1:5050/</code>이고, 이미 사용 중이면 5051, 5052 순서로 자동 이동합니다.</li>
+      </ul>
+    </section>
+  </main>
+</body>
+</html>

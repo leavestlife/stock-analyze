@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>종목 분석기 워크플로우</title>
+  <style>
+    :root {
+      --bg: #060708;
+      --panel: #0e1115;
+      --panel-2: #141922;
+      --line: #26303d;
+      --text: #f5f7fb;
+      --muted: #9aa6b8;
+      --blue: #3b9eff;
+      --green: #19c37d;
+      --yellow: #ffca16;
+      --red: #ff5d5d;
+      --ink: #0b0d10;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at 14% 10%, rgba(59, 158, 255, .22), transparent 28%),
+        radial-gradient(circle at 84% 4%, rgba(25, 195, 125, .14), transparent 26%),
+        linear-gradient(180deg, #090b0f 0%, var(--bg) 42%, #030405 100%);
+      color: var(--text);
+      font-family: Pretendard, "Segoe UI", "Malgun Gothic", Arial, sans-serif;
+      line-height: 1.55;
+    }
+
+    .page {
+      width: min(1180px, calc(100vw - 40px));
+      margin: 0 auto;
+      padding: 46px 0 80px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.25fr .75fr;
+      gap: 24px;
+      align-items: stretch;
+      margin-bottom: 28px;
+    }
+
+    .hero-card,
+    .terminal,
+    .panel,
+    .lane,
+    .check-card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(14, 17, 21, .82);
+      box-shadow: 0 20px 80px rgba(0, 0, 0, .34);
+      backdrop-filter: blur(14px);
+    }
+
+    .hero-card {
+      padding: 34px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 20px;
+      padding: 7px 11px;
+      border: 1px solid rgba(59, 158, 255, .34);
+      border-radius: 999px;
+      color: #b8dcff;
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(42px, 7vw, 82px);
+      line-height: .96;
+      letter-spacing: -0.04em;
+    }
+
+    .lead {
+      max-width: 760px;
+      margin: 22px 0 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .terminal {
+      overflow: hidden;
+      min-height: 278px;
+    }
+
+    .terminal-head {
+      display: flex;
+      gap: 7px;
+      align-items: center;
+      height: 38px;
+      padding: 0 15px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-family: Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--red);
+    }
+
+    .dot:nth-child(2) {
+      background: var(--yellow);
+    }
+
+    .dot:nth-child(3) {
+      background: var(--green);
+    }
+
+    .terminal-body {
+      display: grid;
+      gap: 18px;
+      padding: 24px;
+      font-family: Consolas, monospace;
+    }
+
+    .terminal-row {
+      display: grid;
+      grid-template-columns: 86px 1fr;
+      gap: 14px;
+      align-items: baseline;
+    }
+
+    .terminal-row span {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .terminal-row strong {
+      color: var(--text);
+      font-size: 28px;
+    }
+
+    .terminal-row i {
+      color: var(--green);
+      font-style: normal;
+      font-size: 12px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .panel {
+      padding: 22px;
+    }
+
+    .panel h2 {
+      margin: 0 0 14px;
+      font-size: 19px;
+    }
+
+    .panel p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      margin: 0 5px 8px 0;
+      padding: 4px 9px;
+      border-radius: 999px;
+      background: rgba(59, 158, 255, .12);
+      color: #b8dcff;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .workflow {
+      display: grid;
+      gap: 14px;
+      margin: 26px 0;
+    }
+
+    .lane {
+      display: grid;
+      grid-template-columns: 170px 1fr 210px;
+      gap: 18px;
+      align-items: center;
+      padding: 18px;
+    }
+
+    .step-no {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      color: var(--muted);
+      font-weight: 800;
+    }
+
+    .num {
+      display: grid;
+      place-items: center;
+      width: 42px;
+      height: 42px;
+      border: 1px solid rgba(59, 158, 255, .45);
+      border-radius: 14px;
+      background: rgba(59, 158, 255, .1);
+      color: var(--blue);
+      font-family: Consolas, monospace;
+      font-size: 18px;
+    }
+
+    .lane h3 {
+      margin: 0 0 5px;
+      font-size: 18px;
+    }
+
+    .lane p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    .status {
+      justify-self: end;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 11px;
+      border-radius: 999px;
+      background: rgba(25, 195, 125, .1);
+      color: #8dffc6;
+      font-size: 12px;
+      font-weight: 900;
+    }
+
+    .status.todo {
+      background: rgba(255, 202, 22, .1);
+      color: #ffe38a;
+    }
+
+    .check-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 16px;
+      margin-top: 26px;
+    }
+
+    .check-card {
+      padding: 20px;
+    }
+
+    .check-card h3 {
+      margin: 0 0 12px;
+      font-size: 17px;
+    }
+
+    ul {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+    }
+
+    li + li {
+      margin-top: 8px;
+    }
+
+    code {
+      padding: 2px 6px;
+      border-radius: 7px;
+      background: rgba(255, 255, 255, .08);
+      color: #d7e8ff;
+      font-family: Consolas, monospace;
+    }
+
+    .signal-row {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .signal {
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: var(--panel-2);
+    }
+
+    .signal strong {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+
+    .signal-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: var(--yellow);
+    }
+
+    .signal.green .signal-dot {
+      background: var(--green);
+    }
+
+    .signal.red .signal-dot {
+      background: var(--red);
+    }
+
+    .footer {
+      margin-top: 30px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    @media (max-width: 920px) {
+      .hero,
+      .grid,
+      .check-grid,
+      .signal-row,
+      .lane {
+        grid-template-columns: 1fr;
+      }
+
+      .status {
+        justify-self: start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <article class="hero-card">
+        <div class="eyebrow">CAN SLIM Quant Scanner · Workflow</div>
+        <h1>실사용 종목 분석기 제작 흐름</h1>
+        <p class="lead">
+          레퍼런스 화면을 기반으로 시작해서, 실제 데이터 연결, 점수 산식 정렬, 상세 팝업, 차트,
+          공시·뉴스·애널리스트 데이터까지 붙인 현재 프로젝트의 전체 작업 흐름입니다.
+        </p>
+      </article>
+
+      <aside class="terminal">
+        <div class="terminal-head">
+          <span class="dot"></span>
+          <span class="dot"></span>
+          <span class="dot"></span>
+          <span>scan.workflow</span>
+        </div>
+        <div class="terminal-body">
+          <div class="terminal-row"><span>Frontend</span><strong>Vanilla JS</strong></div>
+          <div class="terminal-row"><span>Backend</span><strong>Node API</strong></div>
+          <div class="terminal-row"><span>Data</span><strong>FMP + Alpha + DART</strong></div>
+          <div class="terminal-row"><span>Verify</span><strong>9 tests</strong> <i>passing</i></div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>목표</h2>
+        <p>종목을 자동으로 훑어서 “좋은 종목인가”와 “지금 들어갈 자리인가”를 분리해 보여주는 스캐너.</p>
+      </article>
+      <article class="panel">
+        <h2>핵심 점수</h2>
+        <p><code>TotalScore</code>는 품질·실적·모멘텀, <code>EntryScore</code>는 타점·과열·눌림·손절 구조를 봅니다.</p>
+      </article>
+      <article class="panel">
+        <h2>현재 방향</h2>
+        <p>레퍼런스와 동일하게 메인 표는 요약, 종목 클릭 시 상세 분석 팝업으로 깊게 들어가는 구조입니다.</p>
+      </article>
+    </section>
+
+    <section class="workflow" aria-label="작업 단계">
+      <article class="lane">
+        <div class="step-no"><span class="num">01</span>기획</div>
+        <div>
+          <h3>레퍼런스 구조 분석</h3>
+          <p>왼쪽 섹터, 메인 종목 요약 표, 종목 클릭 상세 팝업, CAN SLIM·기술·재무·인사이트 탭 구조를 정리했습니다.</p>
+        </div>
+        <span class="status">완료</span>
+      </article>
+
+      <article class="lane">
+        <div class="step-no"><span class="num">02</span>레이아웃</div>
+        <div>
+          <h3>대시보드와 상세 팝업 구현</h3>
+          <p>메인 컬럼, 11개 미국 섹터 분류, 검색 결과 누적, 시그널 정렬, 왼쪽 요약 카드, 상세 탭 UI를 구성했습니다.</p>
+        </div>
+        <span class="status">완료</span>
+      </article>
+
+      <article class="lane">
+        <div class="step-no"><span class="num">03</span>데이터</div>
+        <div>
+          <h3>실데이터 소스 연결</h3>
+          <p>FMP 키 기반 가격·재무·어닝·뉴스, Alpha 보조 데이터, DART 한국 공시, SEC 링크형 공시/내부자/기관 흐름을 연결했습니다.</p>
+        </div>
+        <span class="status">진행 중</span>
+      </article>
+
+      <article class="lane">
+        <div class="step-no"><span class="num">04</span>산식</div>
+        <div>
+          <h3>CAN SLIM·퀀트·수학 지표 정렬</h3>
+          <p>캡처로 받은 원본 산식 기준에 맞춰 원점수, 정규화 점수, 가중치, 기여도를 표시하도록 맞췄습니다.</p>
+        </div>
+        <span class="status">완료</span>
+      </article>
+
+      <article class="lane">
+        <div class="step-no"><span class="num">05</span>상세</div>
+        <div>
+          <h3>팝업 데이터 신뢰도 보강</h3>
+          <p>차트, 기술 지표, 재무 지표, 뉴스 감성, 애널리스트 목표가, SEC/DART 공시, 도움말 툴팁을 보강했습니다.</p>
+        </div>
+        <span class="status">완료</span>
+      </article>
+
+      <article class="lane">
+        <div class="step-no"><span class="num">06</span>검증</div>
+        <div>
+          <h3>테스트와 브라우저 확인</h3>
+          <p><code>server-contract.test.mjs</code>로 검색·상세 payload·ETF/주식 분류·백테스트 계약을 확인하고, 브라우저에서 UI를 점검했습니다.</p>
+        </div>
+        <span class="status">완료</span>
+      </article>
+    </section>
+
+    <section class="check-grid">
+      <article class="check-card">
+        <h3>데이터 파이프라인</h3>
+        <ul>
+          <li>검색 입력: 티커·회사명·별칭을 실제 종목으로 해석</li>
+          <li>가격 캐시: FMP 우선, Alpha/Yahoo 계열 보조 흐름</li>
+          <li>재무/어닝: FMP fundamentals, earnings, analyst target 활용</li>
+          <li>한국 공시: DART 검색 링크와 최근 공시 목록 표시</li>
+          <li>미국 공시: SEC 검색, 13F·Form 4·filings 형태로 노출</li>
+        </ul>
+      </article>
+
+      <article class="check-card">
+        <h3>점수 계산 흐름</h3>
+        <ul>
+          <li>CAN SLIM: C, A, N, S, L, I, M 기준별 점수화</li>
+          <li>퀀트: 가치·평균회귀·모멘텀·MTF·낙폭·스마트머니 등</li>
+          <li>수학: 허스트, 칼만, 통계 Z-Score 등 보조 평가</li>
+          <li>EntryScore: V4 Hybrid 기준으로 과열과 눌림 타점 분리</li>
+          <li>각 카드 토글: 의미 설명, 입력 데이터, 계산 과정 표시</li>
+        </ul>
+      </article>
+    </section>
+
+    <section class="panel">
+      <h2>메인 시그널 의미</h2>
+      <div class="signal-row">
+        <div class="signal green">
+          <strong><span class="signal-dot"></span>초록</strong>
+          <p>EntryScore 75 이상. 진입 타이밍 후보입니다.</p>
+        </div>
+        <div class="signal">
+          <strong><span class="signal-dot"></span>노랑</strong>
+          <p>EntryScore 40~74. 관심 후보지만 관망·매집 관찰 구간입니다.</p>
+        </div>
+        <div class="signal red">
+          <strong><span class="signal-dot"></span>빨강</strong>
+          <p>EntryScore 40 미만. 추격 위험 또는 진입 부적합 구간입니다.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="check-grid">
+      <article class="check-card">
+        <h3>현재 실행 파일</h3>
+        <ul>
+          <li><code>start_app.cmd</code>: 서버 실행용 단일 진입점</li>
+          <li><code>server.mjs</code>: API, 데이터 캐시, 산식 payload</li>
+          <li><code>app.js</code>: 검색, 표 렌더링, 상세 팝업, 차트</li>
+          <li><code>styles.css</code>: 현재 다크 커맨드센터 디자인</li>
+          <li><code>index.html</code>: 앱 첫 화면 구조</li>
+        </ul>
+      </article>
+
+      <article class="check-card">
+        <h3>남은 고도화 후보</h3>
+        <ul>
+          <li>SEC 13F/Form 4를 링크형에서 더 깊은 파싱형으로 확장</li>
+          <li>뉴스 감성의 한글 요약 품질과 출처 신뢰도 점수 보강</li>
+          <li>백테스트 결과를 종목·섹터별로 저장하고 화면에서 비교</li>
+          <li>데이터 누락/대체 계산 여부를 점수 옆에 더 명확히 표시</li>
+        </ul>
+      </article>
+    </section>
+
+    <p class="footer">
+      이 문서는 지금까지 만든 기능과 검증 흐름을 사람이 빠르게 이해하기 위한 작업 지도입니다.
+      실제 앱은 프로젝트 루트의 <code>start_app.cmd</code>로 실행합니다.
+    </p>
+  </main>
+</body>
+</html>

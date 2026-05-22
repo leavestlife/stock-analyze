@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+.venv/
+.uv-cache/
+.npm-cache-vercel/
+node_modules/
+_deploy_stage/
+.playwright-mcp/
+pytest-cache-files-*/
+server*.log
+*.png
+*.jpg
+*.jpeg

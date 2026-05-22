@@ -24,6 +24,7 @@ const SUPABASE_URL = (ENV.SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = ENV.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_PORTFOLIO_TABLE = ENV.SUPABASE_PORTFOLIO_TABLE || "stocklens_portfolios";
 const SUPABASE_SNAPSHOT_TABLE = ENV.SUPABASE_SNAPSHOT_TABLE || "stocklens_analysis_snapshots";
+const CRON_SECRET = ENV.CRON_SECRET || "";
 const DEFAULT_ACCOUNT_SIZE = Number(ENV.TRADING_ACCOUNT_SIZE || 10000);
 const DEFAULT_RISK_PCT = Number(ENV.TRADING_RISK_PCT || 1);
 const SEC_CIK = {
@@ -2885,6 +2886,67 @@ function snapshotPayload(stock) {
   };
 }
 
+function defaultSnapshotTickers() {
+  const envTickers = (ENV.SNAPSHOT_TICKERS || ENV.CRON_TICKERS || "")
+    .split(",")
+    .map((ticker) => ticker.trim().toUpperCase())
+    .filter(Boolean);
+  if (envTickers.length) return envTickers;
+  return BASE_UNIVERSE
+    .filter((item) => item[3] === "us" || item[3] === "kr")
+    .map((item) => item[0])
+    .slice(0, 30);
+}
+
+function cleanSnapshotTickers(tickers, limit = 50) {
+  return [...new Set((tickers || [])
+    .map((ticker) => String(ticker || "").trim().toUpperCase())
+    .filter(Boolean))]
+    .slice(0, limit);
+}
+
+async function buildSnapshotRows(tickers, limit = 50) {
+  const cleanTickers = cleanSnapshotTickers(tickers, limit);
+  const rows = [];
+  const errors = [];
+  for (const ticker of cleanTickers) {
+    try {
+      const security = await resolveSecurity(ticker);
+      if (!security) throw new Error("unknown ticker");
+      const history = await loadHistory(security);
+      const detail = await enrichDetail(security, history, scoreSecurity(security, history));
+      rows.push({
+        ticker: detail.ticker,
+        market: detail.market,
+        payload: snapshotPayload(detail),
+        created_at: new Date().toISOString()
+      });
+    } catch (error) {
+      errors.push({ ticker, error: error.message });
+    }
+  }
+  return { rows, errors, requested: cleanTickers.length };
+}
+
+async function saveSnapshotRows(rows, errors = []) {
+  if (!rows.length) {
+    return {
+      ok: false,
+      configured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY),
+      saved: 0,
+      errors
+    };
+  }
+  const result = await supabaseRest(SUPABASE_SNAPSHOT_TABLE, {
+    method: "POST",
+    headers: { prefer: "return=representation" },
+    body: rows
+  });
+  if (!result.configured) return { ok: false, configured: false, saved: 0, errors, error: result.payload.error };
+  if (!result.ok) return { ok: false, configured: true, saved: 0, errors, error: result.payload, status: result.status };
+  return { ok: true, configured: true, saved: rows.length, errors, items: result.payload };
+}
+
 async function apiSnapshots(req, res, url) {
   if (req.method === "OPTIONS") return cors(res);
   if (req.method === "GET") {
@@ -2899,37 +2961,31 @@ async function apiSnapshots(req, res, url) {
   if (req.method === "POST") {
     const body = await readRequestJson(req);
     const tickers = Array.isArray(body.tickers) ? body.tickers : [];
-    const cleanTickers = tickers.map((ticker) => String(ticker || "").trim().toUpperCase()).filter(Boolean).slice(0, 50);
-    if (!cleanTickers.length) return json(res, 400, { error: "tickers 배열이 필요합니다." });
-    const rows = [];
-    const errors = [];
-    for (const ticker of cleanTickers) {
-      try {
-        const security = await resolveSecurity(ticker);
-        if (!security) throw new Error("unknown ticker");
-        const history = await loadHistory(security);
-        const detail = await enrichDetail(security, history, scoreSecurity(security, history));
-        rows.push({
-          ticker: detail.ticker,
-          market: detail.market,
-          payload: snapshotPayload(detail),
-          created_at: new Date().toISOString()
-        });
-      } catch (error) {
-        errors.push({ ticker, error: error.message });
-      }
-    }
-    if (!rows.length) return json(res, 200, { ok: false, configured: Boolean(SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY), saved: 0, errors });
-    const result = await supabaseRest(SUPABASE_SNAPSHOT_TABLE, {
-      method: "POST",
-      headers: { prefer: "return=representation" },
-      body: rows
-    });
-    if (!result.configured) return json(res, 200, { ok: false, configured: false, saved: 0, errors, error: result.payload.error });
-    if (!result.ok) return json(res, result.status, { ok: false, configured: true, saved: 0, errors, error: result.payload });
-    return json(res, 200, { ok: true, configured: true, saved: rows.length, errors, items: result.payload });
+    const built = await buildSnapshotRows(tickers, 50);
+    if (!built.requested) return json(res, 400, { error: "tickers 배열이 필요합니다." });
+    const saved = await saveSnapshotRows(built.rows, built.errors);
+    return json(res, saved.status || 200, saved);
   }
   return json(res, 405, { error: "Method not allowed" });
+}
+
+async function apiCronDailySnapshot(req, res, url) {
+  if (req.method !== "GET" && req.method !== "POST") return json(res, 405, { error: "Method not allowed" });
+  if (CRON_SECRET) {
+    const auth = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    const provided = auth || url.searchParams.get("secret") || "";
+    if (provided !== CRON_SECRET) return json(res, 401, { ok: false, error: "Unauthorized cron request" });
+  }
+  const queryTickers = url.searchParams.get("tickers");
+  const tickers = queryTickers ? queryTickers.split(",") : defaultSnapshotTickers();
+  const built = await buildSnapshotRows(tickers, Math.min(50, Number(url.searchParams.get("limit") || 30)));
+  const saved = await saveSnapshotRows(built.rows, built.errors);
+  return json(res, saved.status || 200, {
+    ...saved,
+    cron: true,
+    requested: built.requested,
+    generatedAt: new Date().toISOString()
+  });
 }
 
 async function apiCacheStatus(req, res) {
@@ -3210,6 +3266,7 @@ export async function handleRequest(req, res) {
     if (url.pathname === "/api/cache/status") return apiCacheStatus(req, res);
     if (url.pathname === "/api/portfolio") return apiPortfolio(req, res, url);
     if (url.pathname === "/api/snapshots") return apiSnapshots(req, res, url);
+    if (url.pathname === "/api/cron/daily-snapshot") return apiCronDailySnapshot(req, res, url);
     if (url.pathname === "/api/backtest") return apiBacktest(req, res, url);
     if (url.pathname === "/api/stocks") return apiStocks(req, res, url);
     const detail = url.pathname.match(/^\/api\/stocks\/([^/]+)$/);

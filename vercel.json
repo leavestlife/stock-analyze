@@ -20,5 +20,11 @@
       "src": "/(.*)",
       "dest": "/api/[...path].mjs"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/daily-snapshot?limit=30",
+      "schedule": "0 22 * * 1-5"
+    }
   ]
 }

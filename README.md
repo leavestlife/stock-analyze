@@ -1,5 +1,8 @@
 # CAN SLIM Quant Scanner
 
+지인에게 공유 가능한 베타 버전의 종목 분석기입니다.  
+종목의 품질 점수(`TotalScore`)와 지금 들어갈 만한 자리인지 보는 진입 점수(`EntryScore`)를 분리해서 보여줍니다.
+
 ## 실행
 
 프로젝트 폴더에서 아래 파일 하나만 실행하면 됩니다.
@@ -8,7 +11,24 @@
 start_app.cmd
 ```
 
-서버 창이 열린 상태로 유지되어야 브라우저에서 앱이 동작합니다.
+브라우저에서 접속:
+
+```text
+http://127.0.0.1:5050/
+```
+
+서버 상태:
+
+```text
+http://127.0.0.1:5050/api/health
+```
+
+## 베타 사용 기준
+
+- 이 앱은 매수/매도 확답 도구가 아니라 후보군 압축 도구입니다.
+- 가격, 재무, 뉴스, 공시, 목표가는 무료 API 지연/누락이 있을 수 있습니다.
+- 상세 팝업의 데이터 신뢰도와 출처 라인을 확인한 뒤 원자료를 다시 확인하세요.
+- 베타 공유 전에는 `/api/health`, `/api/cache/status`, 대표 종목 상세 팝업을 확인하는 것을 권장합니다.
 
 ## 데이터 갱신
 
@@ -30,7 +50,7 @@ node preload_fundamentals.mjs --limit=23
 node preload_fundamentals.mjs --essentials-only
 ```
 
-실행 전에 계획만 확인:
+실행 전 계획만 확인:
 
 ```powershell
 node preload_fundamentals.mjs --dry-run
@@ -40,7 +60,7 @@ node preload_fundamentals.mjs --dry-run
 
 ## 무료 API 키
 
-`.env`에 아래 키를 넣으면 연결됩니다.
+`.env` 또는 Vercel 환경변수에 아래 값을 넣으면 연결됩니다.
 
 ```text
 FMP_API_KEY=
@@ -51,42 +71,52 @@ SEC_USER_AGENT=StockLens local scanner your-email@example.com
 SUPABASE_URL=
 SUPABASE_SERVICE_ROLE_KEY=
 SUPABASE_PORTFOLIO_TABLE=stocklens_portfolios
+SUPABASE_SNAPSHOT_TABLE=stocklens_analysis_snapshots
+SNAPSHOT_TICKERS=NVDA,AAPL,MSFT,GOOGL,AMZN,META,TSLA,MU
+CRON_SECRET=
 ```
 
 현재 우선순위는 `FMP -> Alpha Vantage -> Yahoo/Naver 가격 기반 대체 계산`입니다.
 
-FMP 무료 플랜도 종목과 엔드포인트에 따라 일부 값이 제한될 수 있습니다. 이 경우 앱은 `부분 연결`로 표시하고 가능한 값만 사용합니다.
+`SUPABASE_SERVICE_ROLE_KEY`는 서버 전용입니다. 브라우저 코드나 공개 저장소에 넣지 마세요.
 
-## Supabase 포트폴리오 백업
+## Supabase
 
 1. Supabase SQL Editor에서 `supabase/schema.sql`을 실행합니다.
-2. `.env` 또는 Vercel 환경변수에 `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`를 넣습니다.
-3. 앱의 포트폴리오 영역에서 `클라우드 저장` / `클라우드 불러오기`를 사용합니다.
+2. Vercel 환경변수에 `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`를 넣습니다.
+3. 포트폴리오 클라우드 저장/복원과 분석 스냅샷 저장이 활성화됩니다.
 
-`SUPABASE_SERVICE_ROLE_KEY`는 서버 전용입니다. 브라우저 코드나 공개 저장소에 넣지 마세요.
+스냅샷 조회:
+
+```text
+/api/snapshots?ticker=NVDA&limit=10
+```
+
+수동 스냅샷 저장:
+
+```text
+POST /api/snapshots
+{ "tickers": ["NVDA", "AAPL"] }
+```
 
 ## Vercel 배포
 
 정적 파일은 루트에서 제공하고, API는 `api/[...path].mjs`가 기존 `server.mjs` 로직을 재사용합니다.
 
-필수 환경변수는 Vercel 프로젝트 설정의 Environment Variables에 넣습니다. 로컬 서버처럼 `.env`를 배포하지 않습니다.
-
-## 상태 확인
-
-앱:
+Vercel Cron은 평일마다 아래 엔드포인트를 호출해 Supabase에 스냅샷을 저장합니다.
 
 ```text
-http://127.0.0.1:5050/
+/api/cron/daily-snapshot?limit=30
 ```
 
-서버 상태:
+`CRON_SECRET`을 설정했다면 아래처럼 호출해야 합니다.
 
 ```text
-http://127.0.0.1:5050/api/health
+/api/cron/daily-snapshot?secret=YOUR_SECRET
 ```
 
-캐시 상태:
+## 배포 주소
 
 ```text
-http://127.0.0.1:5050/api/cache/status
+https://stock-analyze-delta.vercel.app
 ```

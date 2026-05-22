@@ -997,6 +997,34 @@ tbody tr:hover {
   color: var(--link-blue);
 }
 
+.trust-metric {
+  box-shadow: inset 3px 0 0 rgba(100, 116, 139, .55);
+}
+
+.trust-metric.good {
+  box-shadow: inset 3px 0 0 var(--green);
+}
+
+.trust-metric.neutral {
+  box-shadow: inset 3px 0 0 var(--orange);
+}
+
+.trust-metric.bad {
+  box-shadow: inset 3px 0 0 var(--red);
+}
+
+.trust-metric.good strong {
+  color: var(--green);
+}
+
+.trust-metric.neutral strong {
+  color: var(--orange);
+}
+
+.trust-metric.bad strong {
+  color: var(--red);
+}
+
 .entry-meter {
   height: 7px;
   margin-top: 14px;
@@ -2364,6 +2392,18 @@ input[type="checkbox"] {
   line-height: 1.6;
 }
 
+.chart-insight.good {
+  border-color: rgba(58, 211, 137, .42);
+}
+
+.chart-insight.neutral {
+  border-color: rgba(255, 202, 22, .38);
+}
+
+.chart-insight.bad {
+  border-color: rgba(255, 149, 146, .45);
+}
+
 .detail-modal .tab-title-centered {
   position: relative;
   margin-bottom: 18px;
@@ -2530,9 +2570,11 @@ input[type="checkbox"] {
 }
 
 .detail-modal .factor-card b small {
-  margin-left: 2px;
+  display: block;
+  margin-top: 6px;
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.25;
 }
 
 .detail-modal .factor-card.expanded {
@@ -2556,6 +2598,53 @@ input[type="checkbox"] {
 
 .detail-modal .factor-detail.hidden {
   display: none;
+}
+
+.detail-modal .factor-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.detail-modal .factor-detail-meta span,
+.detail-modal .factor-detail-meta strong {
+  display: inline-flex;
+  border-radius: 999px;
+  padding: 4px 8px;
+  background: rgba(59, 158, 255, .1);
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.detail-modal .factor-detail-meta strong {
+  background: rgba(255, 255, 255, .06);
+  color: var(--text-muted);
+}
+
+.detail-modal .factor-detail-warning {
+  margin-bottom: 12px;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff7ed;
+  color: #9a3412;
+}
+
+.detail-modal .factor-detail-warning strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.detail-modal .factor-detail-warning ul {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .detail-modal .factor-contribution {
@@ -2643,6 +2732,18 @@ input[type="checkbox"] {
 
 .detail-modal .trust-summary.bad {
   background: #fff1f2;
+}
+
+.detail-modal .trust-summary.good {
+  border-color: rgba(58, 211, 137, .42);
+}
+
+.detail-modal .trust-summary.neutral {
+  border-color: rgba(255, 202, 22, .38);
+}
+
+.detail-modal .trust-summary.bad {
+  border-color: rgba(255, 149, 146, .45);
 }
 
 .detail-modal .trust-summary span,
@@ -3094,6 +3195,29 @@ button:hover {
 .terminal-grid span {
   color: var(--color-delivered-green);
   font-size: 11px;
+}
+
+.beta-notice {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  max-width: 1240px;
+  margin: 0 auto 16px;
+  padding: 12px 16px;
+  border: 1px solid rgba(255, 214, 102, .36);
+  border-radius: 12px;
+  background: linear-gradient(90deg, rgba(255, 214, 102, .13), rgba(59, 158, 255, .07));
+  color: var(--color-fog);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.beta-notice strong {
+  flex: 0 0 auto;
+  color: var(--color-complained-yellow);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-transform: uppercase;
 }
 
 .scanner-summary {
@@ -3646,6 +3770,16 @@ input[type="checkbox"] {
 .detail-modal .factor-contribution {
   background: rgba(59, 158, 255, .11);
   color: var(--color-opened-blue);
+}
+
+.detail-modal .factor-detail-meta strong {
+  color: var(--color-fog);
+}
+
+.detail-modal .factor-detail-warning {
+  border: 1px solid rgba(255, 202, 22, .22);
+  background: rgba(255, 202, 22, .08);
+  color: var(--color-complained-yellow);
 }
 
 .detail-modal .factor-detail {

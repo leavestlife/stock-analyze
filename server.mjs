@@ -1497,6 +1497,20 @@ function secFilingDocumentUrl(cik, accession) {
     : "";
 }
 
+function secFilingPrimaryDocumentUrl(cik, accession, primaryDocument) {
+  const normalizedCik = normalizeCik(cik);
+  const cleanAccession = String(accession || "").replace(/-/g, "");
+  const document = String(primaryDocument || "").trim();
+  return normalizedCik && cleanAccession && document
+    ? `https://www.sec.gov/Archives/edgar/data/${Number(normalizedCik)}/${cleanAccession}/${encodeURIComponent(document)}`
+    : "";
+}
+
+function finraShortInterestUrl(ticker = "") {
+  const query = ticker ? `?search=${encodeURIComponent(ticker.toUpperCase())}` : "";
+  return `https://www.finra.org/finra-data/browse-catalog/equity-short-interest/files${query}`;
+}
+
 function cikFromSources(meta, overview, fmp) {
   return normalizeCik(overview?.CIK || fmp?.profile?.cik || meta?.cik || SEC_CIK[meta?.ticker]);
 }
@@ -1504,7 +1518,7 @@ function cikFromSources(meta, overview, fmp) {
 async function secSubmissions(ticker, cik) {
   const normalizedCik = normalizeCik(cik);
   if (!normalizedCik) return null;
-  const cacheKey = `sec_submissions_${ticker.toUpperCase()}`;
+  const cacheKey = `sec_submissions_${ticker.toUpperCase()}_${normalizedCik}`;
   const cached = await supplementalRead(cacheKey, DAY_MS);
   if (cached) return cached;
   try {
@@ -1520,12 +1534,26 @@ function filingsFromSubmissions(submissions, ticker, cik, forms = null, limit = 
   const recent = submissions?.filings?.recent;
   const formList = recent?.form || [];
   const wanted = forms ? new Set(forms.map((form) => form.toUpperCase())) : null;
-  return formList.map((form, index) => ({
-    date: recent.filingDate?.[index] || recent.reportDate?.[index] || "",
-    form,
-    title: recent.primaryDocDescription?.[index] || form,
-    url: secFilingDocumentUrl(cik, recent.accessionNumber?.[index]) || secSearchUrl(ticker, form)
-  })).filter((item) => item.date && item.form && (!wanted || wanted.has(String(item.form).toUpperCase()))).slice(0, limit);
+  return formList.map((form, index) => {
+    const accessionNumber = recent.accessionNumber?.[index] || "";
+    const primaryDocument = recent.primaryDocument?.[index] || "";
+    return {
+      date: recent.filingDate?.[index] || recent.reportDate?.[index] || "",
+      reportDate: recent.reportDate?.[index] || "",
+      form,
+      title: recent.primaryDocDescription?.[index] || form,
+      accessionNumber,
+      primaryDocument,
+      url: secFilingPrimaryDocumentUrl(cik, accessionNumber, primaryDocument) || secFilingDocumentUrl(cik, accessionNumber) || secSearchUrl(ticker, form),
+      indexUrl: secFilingDocumentUrl(cik, accessionNumber) || secSearchUrl(ticker, form),
+      source: "SEC submissions"
+    };
+  }).filter((item) => item.date && item.form && (!wanted || wanted.has(String(item.form).toUpperCase()))).slice(0, limit);
+}
+
+async function secFormFilings(ticker, cik, forms, limit = 10) {
+  const submissions = await secSubmissions(ticker, cik);
+  return filingsFromSubmissions(submissions, ticker, cik, forms, limit);
 }
 
 async function secFilings(ticker, cik = "") {
@@ -1632,9 +1660,9 @@ function alphaShortInterest(overview) {
   const shortRatio = numberField(overview?.ShortRatio);
   const shortPercentFloat = percentValue(overview?.ShortPercentFloat ?? overview?.ShortPercentOfFloat);
   const shortPercentOutstanding = percentValue(overview?.ShortPercentOutstanding);
-  if (shortPercentFloat !== null) return { value: `${shortPercentFloat.toFixed(1)}%`, sub: shortRatio !== null ? `Short Ratio ${shortRatio.toFixed(1)} · Alpha Vantage` : "Alpha Vantage" };
-  if (shortPercentOutstanding !== null) return { value: `${shortPercentOutstanding.toFixed(1)}%`, sub: shortRatio !== null ? `발행주식 대비 · Short Ratio ${shortRatio.toFixed(1)}` : "발행주식 대비" };
-  if (shortRatio !== null) return { value: shortRatio.toFixed(1), sub: "Short Ratio · Alpha Vantage" };
+  if (shortPercentFloat !== null) return { value: `${shortPercentFloat.toFixed(1)}%`, sub: shortRatio !== null ? `Short Ratio ${shortRatio.toFixed(1)} · Alpha Vantage` : "Alpha Vantage", source: "Alpha Vantage" };
+  if (shortPercentOutstanding !== null) return { value: `${shortPercentOutstanding.toFixed(1)}%`, sub: shortRatio !== null ? `발행주식 대비 · Short Ratio ${shortRatio.toFixed(1)}` : "발행주식 대비", source: "Alpha Vantage" };
+  if (shortRatio !== null) return { value: shortRatio.toFixed(1), sub: "Short Ratio · Alpha Vantage", source: "Alpha Vantage" };
   return null;
 }
 
@@ -1644,10 +1672,58 @@ function fmpShortInterest(insight) {
   const shortPct = percentValue(row.shortPercentFloat ?? row.shortPercentOfFloat ?? row.shortFloat ?? row.shortPercentOutstanding);
   const shortRatio = numberField(row.shortRatio ?? row.daysToCover);
   const shortInterest = numberField(row.shortInterest ?? row.shortVolume);
-  if (shortPct !== null) return { value: `${shortPct.toFixed(1)}%`, sub: shortRatio !== null ? `Short Ratio ${shortRatio.toFixed(1)} · FMP quote-short` : "FMP quote-short" };
-  if (shortRatio !== null) return { value: shortRatio.toFixed(1), sub: "Short Ratio · FMP quote-short" };
-  if (shortInterest !== null) return { value: Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(shortInterest), sub: "Short interest · FMP" };
+  if (shortPct !== null) return { value: `${shortPct.toFixed(1)}%`, sub: shortRatio !== null ? `Short Ratio ${shortRatio.toFixed(1)} · FMP quote-short` : "FMP quote-short", source: "FMP quote-short" };
+  if (shortRatio !== null) return { value: shortRatio.toFixed(1), sub: "Short Ratio · FMP quote-short", source: "FMP quote-short" };
+  if (shortInterest !== null) return { value: Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(shortInterest), sub: "Short interest · FMP", source: "FMP quote-short" };
   return null;
+}
+
+async function finraShortInterest(ticker) {
+  const upper = String(ticker || "").toUpperCase();
+  if (!upper) return null;
+  const cacheKey = `finra_short_interest_${upper}`;
+  const cached = await supplementalRead(cacheKey, 7 * DAY_MS);
+  if (cached) return cached;
+  try {
+    const response = await fetch("https://api.finra.org/data/group/otcMarket/name/EquityShortInterest", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": SEC_USER_AGENT
+      },
+      body: JSON.stringify({
+        compareFilters: [
+          { compareType: "EQUAL", fieldName: "issueSymbolIdentifier", fieldValue: upper }
+        ],
+        limit: 1,
+        sortFields: ["-settlementDate"]
+      })
+    });
+    if (!response.ok) return null;
+    const rows = await response.json();
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row) return null;
+    const currentShort = numberField(row.currentShortShareNumber);
+    const daysToCover = numberField(row.daysToCoverNumber);
+    const settlement = row.settlementDate || "";
+    const value = currentShort === null
+      ? (daysToCover === null ? "-" : `${daysToCover.toFixed(2)}일`)
+      : Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(currentShort);
+    return supplementalWrite(cacheKey, {
+      value,
+      sub: [
+        "FINRA short interest",
+        settlement ? `결제일 ${settlement}` : "",
+        daysToCover !== null ? `Days to cover ${daysToCover.toFixed(2)}` : ""
+      ].filter(Boolean).join(" · "),
+      source: "FINRA",
+      url: finraShortInterestUrl(upper),
+      raw: row
+    });
+  } catch {
+    return null;
+  }
 }
 
 function fmpInsiderFilings(insight, fallbackForm4 = []) {
@@ -1668,7 +1744,8 @@ function fmpInsiderFilings(insight, fallbackForm4 = []) {
       date: String(date).slice(0, 10),
       form: "4",
       title: detail || "Insider transaction",
-      url: item.link || item.finalLink || item.filingUrl || ""
+      url: item.link || item.finalLink || item.filingUrl || "",
+      source: "FMP insider trading"
     };
   }).filter((item) => item.date || item.title).slice(0, 10);
   return mapped.length ? mapped : fallbackForm4;
@@ -1684,34 +1761,35 @@ function fmpInstitutionalHolders(insight, ticker) {
       holder,
       shares: shares === null ? "-" : Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(shares),
       date: String(date).slice(0, 10),
-      url: secSearchUrl(ticker, "13F-HR")
+      url: secSearchUrl(holder || ticker, "13F-HR"),
+      issuerUrl: secSearchUrl(ticker, "13F-HR"),
+      source: "FMP institutional-holder + SEC EDGAR"
     };
   });
 }
 
 async function secForm4Insight(ticker, cik) {
-  const submissions = await secSubmissions(ticker, cik);
-  const form4 = filingsFromSubmissions(submissions, ticker, cik, ["4", "4/A"], 5);
+  const form4 = await secFormFilings(ticker, cik, ["4", "4/A"], 10);
   if (!form4.length) {
     return {
       value: "확인 필요",
-      sub: "SEC Form 4 검색",
+      sub: "SEC Form 4 검색 연결",
       url: secSearchUrl(ticker, "4"),
       filings: []
     };
   }
   return {
     value: `${form4.length}건`,
-    sub: `${form4[0].date} 최근 Form ${form4[0].form}`,
+    sub: `${form4[0].date} 최근 Form ${form4[0].form} · SEC submissions`,
     url: form4[0].url,
     filings: form4
   };
 }
 
-function usOwnershipInsight(ticker, overview, fmp, form4, fmpInsight = null) {
+function usOwnershipInsight(ticker, overview, fmp, form4, fmpInsight = null, finraShort = null) {
   const institutionPct = formatPercentValue(overview?.PercentInstitutions);
   const insiderPct = formatPercentValue(overview?.PercentInsiders);
-  const shortInterest = fmpShortInterest(fmpInsight) || alphaShortInterest(overview);
+  const shortInterest = fmpShortInterest(fmpInsight) || alphaShortInterest(overview) || finraShort;
   const marketCap = numberField(overview?.MarketCapitalization || fmp?.profile?.marketCap);
   const sharesFloat = numberField(overview?.SharesFloat);
   const holders = fmpInstitutionalHolders(fmpInsight, ticker);
@@ -1719,7 +1797,7 @@ function usOwnershipInsight(ticker, overview, fmp, form4, fmpInsight = null) {
     {
       label: "기관 보유",
       value: institutionPct,
-      sub: holders.length ? `${holders[0].holder} 등 ${holders.length}개 13F 보유자` : institutionPct === "-" ? "SEC 13F 검색 연결" : "Alpha 보유율 · SEC 13F 확인",
+      sub: holders.length ? `${holders[0].holder} 등 ${holders.length}개 13F 보유자` : institutionPct === "-" ? "SEC 13F-HR 검색 연결" : "Alpha 보유율 · SEC 13F-HR 확인",
       url: secSearchUrl(ticker, "13F-HR"),
       source: holders.length ? "FMP 13F + SEC" : institutionPct === "-" ? "SEC" : "Alpha + SEC"
     },
@@ -1733,9 +1811,9 @@ function usOwnershipInsight(ticker, overview, fmp, form4, fmpInsight = null) {
     {
       label: "공매도 비율",
       value: shortInterest?.value || "-",
-      sub: shortInterest?.sub || "무료 API에 공매도 값 없음",
-      url: secSearchUrl(ticker),
-      source: shortInterest ? (shortInterest.sub.includes("FMP") ? "FMP" : "Alpha Vantage") : "미연결"
+      sub: shortInterest?.sub || "FINRA 원자료 확인 필요",
+      url: shortInterest?.url || finraShortInterestUrl(ticker),
+      source: shortInterest?.source || "FINRA 원자료 링크"
     },
     {
       label: "유통주식",
@@ -2235,10 +2313,11 @@ async function enrichDetail(meta, rows, scored) {
     isKr ? dartFinance(meta.ticker).catch(() => null) : null
   ]);
   const cik = canUseStockFundamentals ? cikFromSources(meta, overview, fmp) : "";
-  const [filings, form4, fmpInsight, newsInsight] = await Promise.all([
+  const [filings, form4, fmpInsight, finraShort, newsInsight] = await Promise.all([
     canUseStockFundamentals ? secFilings(meta.ticker, cik) : { items: [], source: sourceStatus("sec", "unavailable") },
     canUseStockFundamentals ? secForm4Insight(meta.ticker, cik) : null,
     canUseStockFundamentals ? fmpUsInsightBundle(meta.ticker).catch(() => null) : null,
+    canUseStockFundamentals ? finraShortInterest(meta.ticker).catch(() => null) : null,
     canUseStockFundamentals ? koreanNewsInsight(meta).catch(() => null) : null
   ]);
   const dartStatus = dartSourceStatus(isKr, dart);
@@ -2292,7 +2371,8 @@ async function enrichDetail(meta, rows, scored) {
     fmp: sourceStatus("fmp", canUseStockFundamentals ? fmpSourceStatus(fmp) : "unavailable"),
     alphaVantage: sourceStatus("alphaVantage", canUseStockFundamentals ? alphaSourceStatus(overview, earnings) : "unavailable"),
     dart: sourceStatus("dart", dartStatus),
-    sec: sourceStatus("sec", secSourceStatus(isKr, filings))
+    sec: sourceStatus("sec", secSourceStatus(isKr, filings)),
+    finra: sourceStatus("finra", canUseStockFundamentals ? (finraShort ? "ok" : "partial") : "unavailable")
   };
   const hasFmpEarnings = fmpRows.length > 0;
   const hasAlphaEarnings = !hasFmpEarnings && alphaEarningsRows(earnings).length > 0;
@@ -2309,7 +2389,7 @@ async function enrichDetail(meta, rows, scored) {
       earnings: earningsRows.length ? earningsRows : [
         ["최근", scored.entry >= 45, scored.finance.targetGap >= 0 ? `+${scored.finance.targetGap}%` : `${scored.finance.targetGap}%`, `현재가 ${scored.price}`, `목표가 ${scored.finance.target}`]
       ],
-      ownership: usOwnershipInsight(meta.ticker, overview, fmp, form4 || { value: "-", sub: "Form 4 없음", url: secSearchUrl(meta.ticker, "4") }, fmpInsight),
+      ownership: usOwnershipInsight(meta.ticker, overview, fmp, form4 || { value: "-", sub: "Form 4 없음", url: secSearchUrl(meta.ticker, "4") }, fmpInsight, finraShort),
       sentiment: {
         label: newsInsight?.label || (scored.entry >= 45 ? "중립" : "주의"),
         positive: newsInsight?.positive ?? (scored.entry >= 60 ? 6 : 3),
@@ -3086,6 +3166,16 @@ async function apiBacktest(req, res, url) {
   const market = url.searchParams.get("market") || "all";
   const requestedLimit = Number(url.searchParams.get("limit"));
   const limit = Number.isFinite(requestedLimit) && requestedLimit > 0 ? Math.min(60, Math.floor(requestedLimit)) : 25;
+  const mode = url.searchParams.get("mode") === "long" || url.searchParams.get("long") === "1" ? "long" : "recent";
+  const requestedYears = Number(url.searchParams.get("years"));
+  const years = Number.isFinite(requestedYears) && requestedYears > 0 ? Math.min(10, Math.max(1, Math.floor(requestedYears))) : 3;
+  const requestedStep = Number(url.searchParams.get("step"));
+  const step = Number.isFinite(requestedStep) && requestedStep > 0 ? Math.min(20, Math.max(1, Math.floor(requestedStep))) : 5;
+  const requestedHorizon = Number(url.searchParams.get("horizon"));
+  const horizon = Number.isFinite(requestedHorizon) && requestedHorizon > 0 ? Math.min(60, Math.max(1, Math.floor(requestedHorizon))) : 10;
+  const requestedMddHorizon = Number(url.searchParams.get("mdd"));
+  const mddHorizon = Number.isFinite(requestedMddHorizon) && requestedMddHorizon > 0 ? Math.min(90, Math.max(horizon, Math.floor(requestedMddHorizon))) : Math.max(20, horizon);
+  const maxWindowRows = mode === "long" ? Math.floor(years * 252) : 380;
   const securities = marketItems(market).slice(0, limit);
   const variants = [
     { name: "V4_HYBRID", high: 75, low: 60, match: (score) => score.score >= 75 && score.entry >= 60 },
@@ -3102,26 +3192,33 @@ async function apiBacktest(req, res, url) {
   ];
   const errors = [];
   let loaded = 0;
+  let evaluatedPoints = 0;
+  let skippedPoints = 0;
 
   for (const security of securities) {
     try {
       const rows = await loadHistory(security);
-      if (rows.length < 230) {
+      const requiredRows = Math.max(230, 200 + Math.max(horizon, mddHorizon) + 1);
+      if (rows.length < requiredRows) {
         errors.push({ ticker: security.ticker, error: `insufficient history: ${rows.length} rows` });
         continue;
       }
       loaded += 1;
-      const start = Math.max(200, rows.length - 380);
-      const end = rows.length - 11;
-      for (let i = start; i < end; i += 5) {
+      const start = Math.max(200, rows.length - maxWindowRows);
+      const end = rows.length - Math.max(horizon, mddHorizon) - 1;
+      for (let i = start; i < end; i += step) {
         const pastRows = rows.slice(0, i + 1);
         const scored = scoreSecurity(security, pastRows);
         const close = rows[i].close;
-        const future10 = rows[i + 10]?.close;
-        if (!Number.isFinite(close) || !Number.isFinite(future10) || close <= 0) continue;
-        const forwardReturn = ((future10 / close) - 1) * 100;
-        const future20 = rows.slice(i + 1, Math.min(i + 21, rows.length)).map((row) => row.close);
-        const forwardMdd = recentMaxDrawdown([close, ...future20], 20);
+        const futureClose = rows[i + horizon]?.close;
+        if (!Number.isFinite(close) || !Number.isFinite(futureClose) || close <= 0) {
+          skippedPoints += 1;
+          continue;
+        }
+        evaluatedPoints += 1;
+        const forwardReturn = ((futureClose / close) - 1) * 100;
+        const futureMddRows = rows.slice(i + 1, Math.min(i + 1 + mddHorizon, rows.length)).map((row) => row.close);
+        const forwardMdd = recentMaxDrawdown([close, ...futureMddRows], mddHorizon);
         for (const variant of stats) {
           variant.evaluated += 1;
           variant.baselineReturns.push(forwardReturn);
@@ -3147,8 +3244,17 @@ async function apiBacktest(req, res, url) {
       market,
       status: "not_ready",
       source: "local",
-      method: "scoreSecurity walk-forward, sampled universe/recent window",
+      method: `scoreSecurity walk-forward; ${mode} window; lookahead blocked`,
+      params: { market, limit, mode, years, step, horizon, mddHorizon, maxWindowRows },
+      coverage: {
+        requested: securities.length,
+        loaded,
+        evaluatedPoints,
+        skippedPoints,
+        errorCount: errors.length
+      },
       results: [],
+      entryBuckets: [],
       errors,
       message: "백테스트에 사용할 로컬 가격 데이터를 불러오지 못했습니다.",
       generatedAt: new Date().toISOString()
@@ -3165,9 +3271,11 @@ async function apiBacktest(req, res, url) {
       samples: variant.returns.length,
       green_ratio: variant.evaluated ? Number((variant.returns.length / variant.evaluated * 100).toFixed(1)) : 0,
       green_return_10d: variant.returns.length ? Number(avgReturn.toFixed(2)) : null,
+      forward_return: variant.returns.length ? Number(avgReturn.toFixed(2)) : null,
       edge: variant.returns.length ? Number((avgReturn - avgBaseline).toFixed(2)) : null,
       win_rate: variant.returns.length ? Number((variant.returns.filter((value) => value > 0).length / variant.returns.length * 100).toFixed(1)) : null,
-      mdd_20d: variant.drawdowns.length ? Number(average(variant.drawdowns).toFixed(2)) : null
+      mdd_20d: variant.drawdowns.length ? Number(average(variant.drawdowns).toFixed(2)) : null,
+      forward_mdd: variant.drawdowns.length ? Number(average(variant.drawdowns).toFixed(2)) : null
     };
   });
   const entryResults = entryBuckets.map((bucket) => {
@@ -3180,9 +3288,11 @@ async function apiBacktest(req, res, url) {
       samples: bucket.returns.length,
       green_ratio: bucket.evaluated ? Number((bucket.returns.length / bucket.evaluated * 100).toFixed(1)) : 0,
       green_return_10d: bucket.returns.length ? Number(avgReturn.toFixed(2)) : null,
+      forward_return: bucket.returns.length ? Number(avgReturn.toFixed(2)) : null,
       edge: bucket.returns.length ? Number((avgReturn - avgBaseline).toFixed(2)) : null,
       win_rate: bucket.returns.length ? Number((bucket.returns.filter((value) => value > 0).length / bucket.returns.length * 100).toFixed(1)) : null,
-      mdd_20d: bucket.drawdowns.length ? Number(average(bucket.drawdowns).toFixed(2)) : null
+      mdd_20d: bucket.drawdowns.length ? Number(average(bucket.drawdowns).toFixed(2)) : null,
+      forward_mdd: bucket.drawdowns.length ? Number(average(bucket.drawdowns).toFixed(2)) : null
     };
   });
   const rankedEntryBuckets = entryResults
@@ -3213,7 +3323,15 @@ async function apiBacktest(req, res, url) {
     market,
     status: totalSamples || entrySamples ? (errors.length ? "partial" : "ok") : "no_samples",
     source: "local",
-    method: `scoreSecurity walk-forward; rows.slice(0, i + 1); ${loaded}/${securities.length} securities; recent sampled window`,
+    method: `scoreSecurity walk-forward; rows.slice(0, i + 1); ${loaded}/${securities.length} securities; ${mode} window; +${horizon}d return; ${mddHorizon}d MDD`,
+    params: { market, limit, mode, years, step, horizon, mddHorizon, maxWindowRows },
+    coverage: {
+      requested: securities.length,
+      loaded,
+      evaluatedPoints,
+      skippedPoints,
+      errorCount: errors.length
+    },
     results: totalSamples ? results : [],
     entryBuckets: entrySamples ? entryResults : [],
     entryCalibration,

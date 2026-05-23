@@ -249,6 +249,8 @@ test("backtest endpoint returns real-engine contract shape", async () => {
     assert.ok(["ok", "partial", "not_ready", "no_samples"].includes(payload.status));
     assert.equal(payload.source, "local");
     assert.equal(typeof payload.method, "string");
+    assert.equal(typeof payload.params, "object");
+    assert.equal(typeof payload.coverage, "object");
     assert.equal(typeof payload.generatedAt, "string");
     assert.ok(Array.isArray(payload.results));
     assert.ok(Array.isArray(payload.errors));
@@ -259,6 +261,30 @@ test("backtest endpoint returns real-engine contract shape", async () => {
       for (const key of ["name", "high", "low", "samples", "green_ratio", "green_return_10d", "edge", "win_rate", "mdd_20d"]) {
         assert.ok(Object.hasOwn(hybrid, key));
       }
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test("backtest endpoint supports long-term walk-forward parameters", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/backtest?market=us&limit=5&mode=long&years=3&step=10&horizon=10&mdd=20`);
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+
+    assert.equal(payload.params.mode, "long");
+    assert.equal(payload.params.years, 3);
+    assert.equal(payload.params.step, 10);
+    assert.equal(payload.params.horizon, 10);
+    assert.equal(payload.params.mddHorizon, 20);
+    assert.match(payload.method, /lookahead|rows\.slice\(0, i \+ 1\)/);
+    if (payload.results.length) {
+      assert.ok(Object.hasOwn(payload.results[0], "forward_return"));
+      assert.ok(Object.hasOwn(payload.results[0], "forward_mdd"));
     }
   } finally {
     server.close();

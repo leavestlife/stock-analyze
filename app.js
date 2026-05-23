@@ -575,10 +575,39 @@ function classificationRow(stock) {
   return `<div class="metric-row classification-metric"><span>분류 근거<br><small>${escapeHtml(item.source || "unknown")} · 신뢰도 ${escapeHtml(item.confidence || "-")}</small></span><strong>${escapeHtml(item.label || item.assetType || "-")}</strong></div>`;
 }
 
+function trustCounts(stock) {
+  const statuses = Object.values(stock.sourceStatus || {}).map((item) => item?.status);
+  return {
+    ok: Number(stock.trust?.okCount ?? statuses.filter((status) => status === "ok").length),
+    fallback: Number(stock.trust?.fallbackCount ?? statuses.filter((status) => status === "fallback" || status === "missing_key" || status === "missing").length),
+    weak: Number(stock.trust?.weakCount ?? statuses.filter((status) => status === "partial" || status === "unavailable").length)
+  };
+}
+
+function trustTone(stock) {
+  if (stock.trust?.label === "높음") return "good";
+  if (stock.trust?.label === "낮음" || isMissingData(stock)) return "bad";
+  const counts = trustCounts(stock);
+  return counts.fallback >= 2 ? "bad" : counts.fallback || counts.weak ? "neutral" : "good";
+}
+
+function trustCountsText(stock) {
+  const counts = trustCounts(stock);
+  return counts.fallback || counts.weak
+    ? `연결 ${counts.ok} · 대체/누락 ${counts.fallback} · 부분/미지원 ${counts.weak}`
+    : `연결 ${counts.ok} · 주요 소스 정상`;
+}
+
+function dataTrustMetricRow(stock) {
+  if (!stock.trust) return "";
+  return `<div class="metric-row trust-metric ${trustTone(stock)}"><span>데이터 신뢰도<br><small>${escapeHtml(trustCountsText(stock))}</small></span><strong>${escapeHtml(stock.trust.label || "-")}</strong></div>`;
+}
+
 function renderMetrics(stock) {
   const f = stock.finance || {};
   document.querySelector("#metricList").innerHTML = `
     ${classificationRow(stock)}
+    ${dataTrustMetricRow(stock)}
     <div class="metric-row"><span>현재가</span><strong>${priceText(stock)}</strong></div>
     <div class="metric-row"><span>등락률</span><strong class="${Number(stock.change) >= 0 ? "up" : "down"}">${percentText(stock.change)}</strong></div>
     <div class="metric-row"><span>목표가<br><small>ATR 기반</small></span><strong>${priceText(stock, f.target)}</strong></div>
@@ -623,18 +652,22 @@ function renderChart(stock) {
       volume: 0
     })).filter((row) => Number.isFinite(row.close));
   const data = rows.map((row) => row.close);
+  const chartInsight = document.querySelector("#chartInsight");
   if (!rows.length) {
     document.querySelector("#modalChart").innerHTML = `<div class="chart-empty">가격 데이터가 아직 없어 차트를 표시할 수 없습니다.</div>`;
-    document.querySelector("#chartInsight").innerHTML = `<strong>차트 데이터 없음</strong><p>가격 캐시를 먼저 적재해야 합니다.</p>`;
+    chartInsight.className = "chart-insight bad";
+    chartInsight.innerHTML = `<strong>차트 데이터 없음</strong><p>가격 캐시를 먼저 적재해야 합니다.</p>`;
     return;
   }
   const firstDate = rows[0]?.date || "-";
   const lastDate = rows.at(-1)?.date || "-";
   const volumeCount = rows.filter((row) => row.volume > 0).length;
   const priceSource = stock.sourceStatus?.price?.source || stock.dataSource || "가격 캐시";
-  document.querySelector("#chartInsight").innerHTML = `
+  const priceStatus = stock.sourceStatus?.price?.status || (stock.dataSource === "missing" ? "missing" : "ok");
+  chartInsight.className = `chart-insight ${sourceStatusPass(priceStatus) === true ? "good" : sourceStatusPass(priceStatus) === false ? "bad" : "neutral"}`;
+  chartInsight.innerHTML = `
     <strong>차트 데이터</strong>
-    <p>${escapeHtml(firstDate)} ~ ${escapeHtml(lastDate)} · ${rows.length}개 봉 · 거래량 ${volumeCount ? "포함" : "없음"} · 출처 ${escapeHtml(priceSource)}</p>
+    <p>${escapeHtml(firstDate)} ~ ${escapeHtml(lastDate)} · ${rows.length}개 봉 · 거래량 ${volumeCount ? "포함" : "없음"} · ${escapeHtml(sourceStatusLabel(priceStatus))} · 출처 ${escapeHtml(priceSource)}</p>
   `;
   if (window.Chart) {
     document.querySelector("#modalChart").innerHTML = `<canvas id="priceChartCanvas"></canvas>`;
@@ -861,11 +894,13 @@ function renderSecFilingItems(filings, defaultUrl) {
     const form = Array.isArray(item) ? item[1] : item.form;
     const title = Array.isArray(item) ? item[2] : item.title;
     const href = Array.isArray(item) ? defaultUrl : item.url;
+    const source = Array.isArray(item) ? "" : item.source;
     return `
       <a href="${escapeHtml(href || defaultUrl)}" target="_blank" rel="noopener">
         <time>${escapeHtml(date || "")}</time>
         <b>${escapeHtml(form || "")}</b>
         <strong>${escapeHtml(title || form || "")}</strong>
+        ${source ? `<em>${escapeHtml(source)}</em>` : ""}
         <span>&rarr;</span>
       </a>
     `;
@@ -896,6 +931,7 @@ function renderInstitutionalHolders(items, defaultUrl) {
       <b>13F</b>
       <strong>${escapeHtml(item.holder || "기관")}</strong>
       <span>${escapeHtml(item.shares || "-")}</span>
+      ${item.source ? `<em>${escapeHtml(item.source)}</em>` : ""}
     </a>
   `).join("");
 }
@@ -1190,10 +1226,11 @@ function statusClass(pass) {
 function indicatorDataBadge(item) {
   const status = item?.dataStatus;
   const source = item?.dataSource;
-  if (!status && !source) return "";
-  const label = status === "real" ? "실데이터" : status === "fallback" ? "대체 계산" : "가격 기반";
+  const label = item?.dataLabel || (status === "real" ? "실데이터" : status === "fallback" ? "대체 계산" : "가격 기반");
+  const tone = item?.dataTone || status || "derived";
+  if (!status && !source && !item?.dataLabel) return "";
   const sourceText = source && source !== label ? ` · ${source}` : "";
-  return `<em class="indicator-source ${escapeHtml(status || "derived")}">${escapeHtml(label)}${escapeHtml(sourceText)}</em>`;
+  return `<em class="indicator-source ${escapeHtml(tone)}">${escapeHtml(label)}${escapeHtml(sourceText)}</em>`;
 }
 
 function indicatorRow(row) {
@@ -1275,6 +1312,28 @@ function renderFinanceContext(stock) {
         <span>업데이트</span>
         <strong>${formatSourceTime(updatedAt)}</strong>
         <small>상세 API 응답 기준</small>
+      </article>
+    </div>
+  `;
+}
+
+function renderTechnicalContext(stock) {
+  const price = stock.sourceStatus?.price || {};
+  const technical = stock.technicalIndicators || [];
+  const derivedCount = technical.filter((item) => item?.dataStatus === "derived").length;
+  const fallbackCount = technical.filter((item) => item?.dataStatus === "fallback").length;
+  const sourceText = [...new Set(technical.map((item) => item?.dataSource).filter(Boolean))].join(" + ") || price.source || stock.dataSource || "가격 기반 계산";
+  return `
+    <div class="finance-context technical-context">
+      <article>
+        <span>기술 지표 소스</span>
+        <strong>${escapeHtml(sourceText)}</strong>
+        <small>${escapeHtml(sourceStatusLabel(price.status || "ok"))} · ${formatSourceTime(price.updatedAt)}</small>
+      </article>
+      <article>
+        <span>지표 상태</span>
+        <strong>파생 ${derivedCount} · 대체 ${fallbackCount}</strong>
+        <small>RSI, ADX, ATR, VWAP 등은 가격/거래량에서 계산됩니다.</small>
       </article>
     </div>
   `;
@@ -1484,12 +1543,19 @@ function factorDataBadge(card) {
 }
 
 function factorScoreSuffix(card) {
-  const display = Number(card.displayValue);
+  const raw = Number(card.rawScore ?? card.displayValue);
   const normalized = Number(card.normalizedScore);
-  if (Number.isFinite(display) && Number.isFinite(normalized) && Math.abs(display - normalized) > 0.05) {
-    return `<small> 원점수 · 정규화 ${normalized.toFixed(1)}</small>`;
+  if (Number.isFinite(raw) && Number.isFinite(normalized) && Math.abs(raw - normalized) > 0.05) {
+    return `<small>정규화 점수 · 원점수 ${raw.toFixed(1)}</small>`;
   }
   return "<small>/100</small>";
+}
+
+function factorSurfaceScore(card) {
+  const normalized = Number(card.normalizedScore);
+  if (Number.isFinite(normalized)) return normalized;
+  const display = Number(card.displayValue);
+  return Number.isFinite(display) ? display : null;
 }
 
 const FACTOR_GUIDES = {
@@ -1601,8 +1667,23 @@ function renderFactorDetail(detail) {
   const inputs = detail.inputs || [];
   const calculation = detail.calculation || [];
   const summary = factorJudgementText(detail.body || detail.summary || "");
+  const warnings = [];
+  if (detail.dataStatus === "fallback") warnings.push("대체 계산값입니다. 실데이터 연결 전까지 참고용으로만 보세요.");
+  if (detail.dataStatus === "derived") warnings.push("가격 기반 파생 지표입니다. 재무/공시 원자료와 함께 확인하세요.");
+  if (!inputs.length) warnings.push("세부 입력값이 없어 계산 근거를 완전히 검증하기 어렵습니다.");
+  if (!calculation.length) warnings.push("계산 과정이 없어 정규화 방식을 화면에서 재확인하기 어렵습니다.");
   return `
     <div class="factor-detail hidden">
+      <div class="factor-detail-meta">
+        <span>${escapeHtml(detail.dataStatus === "real" ? "실데이터" : detail.dataStatus === "fallback" ? "대체 계산" : "가격 기반")}</span>
+        <strong>${escapeHtml(detail.dataSource || "출처 미표시")}</strong>
+      </div>
+      ${warnings.length ? `
+        <div class="factor-detail-warning">
+          <strong>신뢰도 확인</strong>
+          <ul>${warnings.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>
+        </div>
+      ` : ""}
       ${summary ? `
         <div class="factor-detail-section factor-judgement">
           <strong>현재 판정</strong>
@@ -1622,6 +1703,23 @@ function renderFactorDetail(detail) {
   `;
 }
 
+function renderFactorCard(card, index) {
+  const surfaceScore = factorSurfaceScore(card);
+  return `
+    <article class="factor-card ${statusClass(card.pass)}">
+      <header>
+        <span>${escapeHtml(card.code)}</span>
+        <div><strong>${escapeHtml(card.title)}</strong><small>${escapeHtml(card.desc)}</small>${factorDataBadge(card)}</div>
+        <button type="button" class="factor-toggle" data-factor-index="${index}" aria-expanded="false" aria-label="상세">⌄</button>
+      </header>
+      <b>${surfaceScore === null ? "데이터 부족" : surfaceScore.toFixed(1)}${factorScoreSuffix(card)}</b>
+      <div class="factor-bar"><i style="width:${Number.isFinite(card.barValue) ? Math.max(4, Math.min(100, card.barValue)) : 12}%"></i></div>
+      <p>${escapeHtml(factorGuide(card))}</p>
+      ${renderFactorDetail({ ...(card.detail || {}), body: card.body, dataStatus: card.dataStatus, dataSource: card.dataSource })}
+    </article>
+  `;
+}
+
 function renderCanslimCards(stock) {
   const cards = factorCards(stock);
   const rows = canslimSummaryRows(stock);
@@ -1638,26 +1736,17 @@ function renderCanslimCards(stock) {
       `).join("")}
     </div>
     <div class="factor-card-grid">
-      ${cards.map((card, index) => `
-        <article class="factor-card ${statusClass(card.pass)}">
-          <header>
-            <span>${escapeHtml(card.code)}</span>
-            <div><strong>${escapeHtml(card.title)}</strong><small>${escapeHtml(card.desc)}</small>${factorDataBadge(card)}</div>
-            <button type="button" class="factor-toggle" data-factor-index="${index}" aria-expanded="false" aria-label="상세">⌄</button>
-          </header>
-          <b>${card.displayValue === null ? "데이터 부족" : card.displayValue.toFixed(1)}${factorScoreSuffix(card)}</b>
-          <div class="factor-bar"><i style="width:${Number.isFinite(card.barValue) ? Math.max(4, Math.min(100, card.barValue)) : 12}%"></i></div>
-          <p>${escapeHtml(factorGuide(card))}</p>
-          ${renderFactorDetail({ ...(card.detail || {}), body: card.body })}
-        </article>
-      `).join("")}
+      ${cards.map(renderFactorCard).join("")}
     </div>
   `;
 }
 
 function renderTechnicalRows(stock) {
   if (stock.technicalIndicators && stock.technicalIndicators.length) {
-    tabContent.innerHTML = `<div class="indicator-list">${stock.technicalIndicators.map(indicatorRow).join("")}</div>`;
+    tabContent.innerHTML = `
+      ${renderTechnicalContext(stock)}
+      <div class="indicator-list">${stock.technicalIndicators.map(indicatorRow).join("")}</div>
+    `;
     return;
   }
   const s = detailStats(stock);
@@ -1671,7 +1760,10 @@ function renderTechnicalRows(stock) {
     ["3개월 수익률", "단기 모멘텀", pctText(s.momentum, 1), s.momentum > 0],
     ["거래량 비율", "참여 강도", `${s.volumeRatio.toFixed(2)}배`, s.volumeRatio >= 1]
   ];
-  tabContent.innerHTML = `<div class="indicator-list">${rows.map(indicatorRow).join("")}</div>`;
+  tabContent.innerHTML = `
+    ${renderTechnicalContext(stock)}
+    <div class="indicator-list">${rows.map(indicatorRow).join("")}</div>
+  `;
 }
 function renderFinanceRows(stock) {
   if (stock.financeIndicators && stock.financeIndicators.length) {
@@ -1722,13 +1814,14 @@ function sourceStatusTitle(key, item) {
 
 function renderTrustSummary(stock) {
   if (!stock.trust) return "";
-  const tone = stock.trust.label === "높음" ? "good" : stock.trust.label === "낮음" ? "bad" : "neutral";
+  const tone = trustTone(stock);
   const warning = scoreReferenceWarning(stock);
   return `
     <article class="trust-summary ${tone}">
       <span>데이터 신뢰도</span>
       <strong>${escapeHtml(stock.trust.label)}</strong>
       <small>${escapeHtml(stock.trust.note || "")}</small>
+      <small>${escapeHtml(trustCountsText(stock))}</small>
       ${warning ? `<em>${escapeHtml(warning)}</em>` : ""}
     </article>
   `;
@@ -1748,12 +1841,16 @@ function renderClassificationEvidence(stock) {
 }
 
 function renderSourceStatus(stock) {
-  const rows = Object.entries(stock.sourceStatus || {}).map(([key, item]) => indicatorRow([
-    sourceStatusTitle(key, item),
-    item?.source || key,
-    sourceStatusLabel(item?.status),
-    sourceStatusPass(item?.status)
-  ])).join("");
+  const rows = Object.entries(stock.sourceStatus || {}).map(([key, item]) => indicatorRow({
+    title: sourceStatusTitle(key, item),
+    desc: `${item?.source || key} · 업데이트 ${formatSourceTime(item?.updatedAt)}`,
+    value: sourceStatusLabel(item?.status),
+    pass: sourceStatusPass(item?.status),
+    dataStatus: item?.status === "ok" ? "real" : item?.status === "fallback" || item?.status === "missing_key" || item?.status === "missing" ? "fallback" : "derived",
+    dataSource: item?.source || key,
+    dataLabel: sourceStatusLabel(item?.status),
+    dataTone: item?.status === "ok" ? "real" : item?.status === "fallback" || item?.status === "missing_key" || item?.status === "missing" ? "fallback" : "derived"
+  })).join("");
   const classification = renderClassificationEvidence(stock);
   return rows || classification ? `
     <article class="intel-card flush">
@@ -2501,7 +2598,7 @@ async function runBacktest() {
   const backtestRows = document.querySelector("#backtestRows");
   backtestRows.innerHTML = `<tr><td colspan="8">백테스트를 계산하는 중입니다...</td></tr>`;
   try {
-    const response = await fetch(`/api/backtest?market=${activeMarket}`);
+    const response = await fetch(`/api/backtest?market=${activeMarket}&mode=long&years=3&step=5&horizon=10&mdd=20`);
     if (!response.ok) throw new Error(`API ${response.status}`);
     const payload = await response.json();
     const rows = payload.results || [];
@@ -2553,8 +2650,10 @@ async function runBacktest() {
         <td>${pct(row.mdd_20d)}</td>
       </tr>
     `).join("");
+    const coverage = payload.coverage || {};
+    const params = payload.params || {};
     backtestRows.innerHTML = `
-      <tr><td colspan="8">${escapeHtml(statusText)} · ${escapeHtml(payload.source || "local")} · 전략 샘플 ${totalSamples}개 · Entry 구간 샘플 ${entrySamples}개 · ${escapeHtml(payload.method || "walk-forward")}</td></tr>
+      <tr><td colspan="8">${escapeHtml(statusText)} · ${escapeHtml(payload.source || "local")} · ${escapeHtml(params.mode || "recent")} ${escapeHtml(String(params.years || 3))}년 · 평가시점 ${escapeHtml(String(coverage.evaluatedPoints || 0))}개 · 전략 샘플 ${totalSamples}개 · Entry 구간 샘플 ${entrySamples}개</td></tr>
       ${calibrationHtml}
       <tr class="backtest-section-row"><td colspan="8">전략 후보 검증</td></tr>
       ${strategyHtml || `<tr><td colspan="8">전략 조건에 맞는 샘플이 아직 없습니다.</td></tr>`}

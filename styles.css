@@ -1647,7 +1647,7 @@ a.intel-card {
 }
 
 .filing-list.sec a {
-  grid-template-columns: 96px 58px 1fr 26px;
+  grid-template-columns: 96px 58px 1fr minmax(80px, auto) 26px;
 }
 
 .filing-list time {
@@ -1658,6 +1658,13 @@ a.intel-card {
 .filing-list span {
   color: var(--text-muted);
   text-align: right;
+}
+
+.filing-list em {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: normal;
+  white-space: nowrap;
 }
 
 body {

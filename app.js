@@ -20,6 +20,7 @@ let scanCount = 0;
 let apiMode = false;
 let modalChartInstance = null;
 let searchResultTickers = new Set();
+const STOCK_LOAD_TIMEOUT_MS = 45000;
 let portfolio = {
   accountSize: 10000,
   holdings: [],
@@ -412,7 +413,7 @@ async function loadStocks({ sampleDrift = false } = {}) {
   try {
     stockRows.innerHTML = `<tr><td colspan="13">가격 데이터와 점수를 계산하는 중입니다...</td></tr>`;
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), 5000) : null;
+    const timer = controller ? setTimeout(() => controller.abort(), STOCK_LOAD_TIMEOUT_MS) : null;
     const safeQuery = query.length <= 40 ? query : "";
     const queryParam = safeQuery ? `&query=${encodeURIComponent(safeQuery)}` : "";
     const response = await fetch(`/api/stocks?market=${activeMarket}${queryParam}`, controller ? { signal: controller.signal } : {});
@@ -429,8 +430,14 @@ async function loadStocks({ sampleDrift = false } = {}) {
     }
     apiMode = Boolean(payload.items && payload.items.length);
   } catch (error) {
-    if (!query) stocks = [];
+    if (!query && !stocks.length) stocks = [];
     apiMode = false;
+    if (!stocks.length) {
+      stockRows.innerHTML = `<tr><td colspan="13">서버 계산이 오래 걸리고 있습니다. 잠시 후 다시 스캔을 눌러 주세요.</td></tr>`;
+      renderMarketChips();
+      renderPortfolio();
+      return;
+    }
   }
   renderMarketChips();
   renderRows();

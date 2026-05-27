@@ -70,3 +70,43 @@ create index if not exists stocklens_analysis_snapshots_ticker_created_idx
 
 comment on table public.stocklens_analysis_snapshots is
   'Server-side score and signal snapshots for tracking daily scanner changes.';
+
+create table if not exists public.stocklens_scanned_stocks (
+  ticker text primary key,
+  payload jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+alter table public.stocklens_scanned_stocks enable row level security;
+
+grant select, insert, update, delete on public.stocklens_scanned_stocks to service_role;
+
+drop policy if exists stocklens_scanned_stocks_deny_anon_select on public.stocklens_scanned_stocks;
+drop policy if exists stocklens_scanned_stocks_deny_anon_insert on public.stocklens_scanned_stocks;
+drop policy if exists stocklens_scanned_stocks_deny_anon_update on public.stocklens_scanned_stocks;
+
+create policy stocklens_scanned_stocks_deny_anon_select
+  on public.stocklens_scanned_stocks
+  for select
+  to anon, authenticated
+  using (false);
+
+create policy stocklens_scanned_stocks_deny_anon_insert
+  on public.stocklens_scanned_stocks
+  for insert
+  to anon, authenticated
+  with check (false);
+
+create policy stocklens_scanned_stocks_deny_anon_update
+  on public.stocklens_scanned_stocks
+  for update
+  to anon, authenticated
+  using (false)
+  with check (false);
+
+create index if not exists stocklens_scanned_stocks_updated_at_idx
+  on public.stocklens_scanned_stocks (updated_at desc);
+
+comment on table public.stocklens_scanned_stocks is
+  'Recently scanned ticker summaries persisted for the Vercel deployment. Access through server API with Supabase service role key only.';

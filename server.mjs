@@ -2,6 +2,7 @@
 import { readFile, mkdir, readdir, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -9,8 +10,14 @@ const SERVER_FILE = fileURLToPath(import.meta.url);
 const ROOT = dirname(SERVER_FILE);
 const PORT = Number(process.env.PORT || 5050);
 const CACHE_DIR = join(ROOT, "data", "cache", "node");
+const SCANNED_STOCKS_FILE = join(CACHE_DIR, "scanned_stocks.json");
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PRICE_CACHE_MS = 6 * 60 * 60 * 1000;
+const MIN_US_HISTORY_ROWS = 40;
+const FMP_BUNDLE_SCHEMA_VERSION = 2;
+const BACKTEST_HISTORY_LIMIT = 30;
+const ENRICHMENT_QUEUE_LIMIT = 40;
+const ENRICHMENT_BATCH_LIMIT = 12;
 const ENV = loadEnv();
 const ALPHA_VANTAGE_API_KEY = ENV.ALPHA_VANTAGE_API_KEY || "";
 const FMP_API_KEYS = [
@@ -24,9 +31,13 @@ const SUPABASE_URL = (ENV.SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_SERVICE_ROLE_KEY = ENV.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_PORTFOLIO_TABLE = ENV.SUPABASE_PORTFOLIO_TABLE || "stocklens_portfolios";
 const SUPABASE_SNAPSHOT_TABLE = ENV.SUPABASE_SNAPSHOT_TABLE || "stocklens_analysis_snapshots";
+const SUPABASE_SCANNED_TABLE = ENV.SUPABASE_SCANNED_TABLE || "stocklens_scanned_stocks";
 const CRON_SECRET = ENV.CRON_SECRET || "";
 const DEFAULT_ACCOUNT_SIZE = Number(ENV.TRADING_ACCOUNT_SIZE || 10000);
 const DEFAULT_RISK_PCT = Number(ENV.TRADING_RISK_PCT || 1);
+const enrichmentQueue = [];
+const enrichmentStatus = new Map();
+let enrichmentRunning = false;
 const SEC_CIK = {
   AAPL: "0000320193",
   GOOGL: "0001652044",
@@ -119,23 +130,145 @@ function sourceStatus(source, status, extra = {}) {
   return { source, status, updatedAt: new Date().toISOString(), ...extra };
 }
 
-function trustSummary(sourceStatusMap = {}) {
+function trustSummary(sourceStatusMap = {}, evidence = {}) {
   const statuses = Object.values(sourceStatusMap).map((item) => item?.status).filter(Boolean);
   const fallbackCount = statuses.filter((status) => ["fallback", "missing_key", "missing"].includes(status)).length;
   const weakCount = statuses.filter((status) => ["partial", "unavailable"].includes(status)).length;
   const okCount = statuses.filter((status) => status === "ok").length;
-  const label = fallbackCount === 0 && weakCount <= 1 && okCount > 0 ? "높음" : fallbackCount <= 2 ? "보통" : "낮음";
+  const issueCount = Number(evidence.issueCount || 0);
+  const label = issueCount >= 3 || fallbackCount > 2
+    ? "낮음"
+    : issueCount || weakCount > 1 || fallbackCount
+      ? "보통"
+      : okCount > 0
+        ? "높음"
+        : "낮음";
   return {
     label,
     okCount,
     fallbackCount,
     weakCount,
-    note: fallbackCount
+    issueCount,
+    note: issueCount
+      ? `교차검증/이상치 경고 ${issueCount}건을 확인하세요.`
+      : fallbackCount
       ? "일부 항목은 대체값 또는 API 미연결 상태입니다."
       : weakCount
         ? "일부 보조 데이터는 부분 연결 상태입니다."
       : "주요 데이터가 정상 연결되었습니다."
   };
+}
+
+function compareNumber(label, leftSource, leftValue, rightSource, rightValue, tolerancePct = 8) {
+  const left = Number(leftValue);
+  const right = Number(rightValue);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return null;
+  const base = Math.max(Math.abs(left), Math.abs(right), 1);
+  const gapPct = Math.abs(left - right) / base * 100;
+  const status = gapPct <= tolerancePct ? "ok" : "warn";
+  return {
+    label,
+    status,
+    gapPct: Number(gapPct.toFixed(2)),
+    summary: status === "ok"
+      ? `${leftSource}와 ${rightSource} 값 차이가 ${gapPct.toFixed(1)}%로 허용 범위입니다.`
+      : `${leftSource}와 ${rightSource} 값 차이가 ${gapPct.toFixed(1)}%입니다. 원자료 확인이 필요합니다.`,
+    values: [
+      { source: leftSource, value: Number(left.toFixed(4)) },
+      { source: rightSource, value: Number(right.toFixed(4)) }
+    ]
+  };
+}
+
+function latestClose(rows) {
+  const row = [...(rows || [])].reverse().find((item) => Number.isFinite(Number(item?.close)));
+  return row ? Number(row.close) : null;
+}
+
+function fmpNumericBundle(bundle) {
+  const quote = bundle?.quote || {};
+  const ratios = bundle?.ratios || {};
+  return {
+    price: numberField(quote.price),
+    pe: numberField(quote.pe) ?? numberField(ratios.priceToEarningsRatioTTM),
+    pb: numberField(ratios.priceToBookRatioTTM),
+    roe: numberField(ratios.returnOnEquityTTM),
+    eps: numberField(quote.eps) ?? numberField(ratios.netIncomePerShareTTM),
+    target: fmpTargetPrice(bundle)
+  };
+}
+
+function alphaNumericBundle(overview) {
+  return {
+    pe: numberField(overview?.PERatio),
+    pb: numberField(overview?.PriceToBookRatio),
+    roe: numberField(overview?.ReturnOnEquityTTM),
+    eps: numberField(overview?.EPS),
+    target: numberField(overview?.AnalystTargetPrice)
+  };
+}
+
+function buildDataCrossChecks({ meta, rows, scored, fmp, overview }) {
+  const checks = [];
+  const fmpValues = fmpNumericBundle(fmp);
+  const alphaValues = alphaNumericBundle(overview);
+  const close = latestClose(rows);
+  const priceCheck = compareNumber("현재가", scored.dataSource || "선택 가격", scored.price, "가격봉", close, 5);
+  if (priceCheck) checks.push(priceCheck);
+  if (Number.isFinite(fmpValues.price)) {
+    const fmpPriceCheck = compareNumber("현재가", "FMP", fmpValues.price, scored.dataSource || "선택 가격", scored.price, 5);
+    if (fmpPriceCheck) checks.push(fmpPriceCheck);
+  }
+  for (const [key, label, tolerance] of [
+    ["pe", "PER", 15],
+    ["pb", "PBR", 15],
+    ["roe", "ROE", 20],
+    ["eps", "EPS", 15],
+    ["target", "목표가", 20]
+  ]) {
+    const check = compareNumber(label, "FMP", fmpValues[key], "Alpha Vantage", alphaValues[key], tolerance);
+    if (check) checks.push(check);
+  }
+  return {
+    assetType: meta.asset_type || "stock",
+    checks,
+    okCount: checks.filter((item) => item.status === "ok").length,
+    warnCount: checks.filter((item) => item.status === "warn").length
+  };
+}
+
+function buildAnomalyWarnings({ meta, scored, fmp, overview, rows }) {
+  const warnings = [];
+  const fmpValues = fmpNumericBundle(fmp);
+  const alphaValues = alphaNumericBundle(overview);
+  const price = Number(scored.price);
+  const close = latestClose(rows);
+  const finance = {
+    pe: fmpValues.pe ?? alphaValues.pe,
+    pb: fmpValues.pb ?? alphaValues.pb,
+    roe: fmpValues.roe ?? alphaValues.roe,
+    eps: fmpValues.eps ?? alphaValues.eps,
+    target: fmpValues.target ?? alphaValues.target
+  };
+
+  if (!Number.isFinite(price) || price <= 0) warnings.push({ level: "critical", label: "가격 오류", summary: "현재가가 없거나 0 이하입니다. 점수 계산을 신뢰하기 어렵습니다." });
+  if (Number.isFinite(close) && Number.isFinite(price) && Math.abs(price - close) / Math.max(Math.abs(price), Math.abs(close), 1) > .08) {
+    warnings.push({ level: "warn", label: "가격 불일치", summary: "선택 현재가와 최근 가격봉 종가 차이가 8%를 넘습니다. 장중/캐시 시점을 확인하세요." });
+  }
+  if (meta.asset_type === "etf") {
+    warnings.push({ level: "info", label: "ETF 처리", summary: "ETF는 EPS, ROE, PER 같은 개별기업 재무지표를 점수 핵심값으로 사용하지 않습니다." });
+  } else {
+    if (Number.isFinite(finance.pe) && (finance.pe < 0 || finance.pe > 200)) warnings.push({ level: "warn", label: "PER 이상치", summary: `PER ${finance.pe.toFixed(1)}은 일반 범위를 벗어납니다. 일회성 이익/손실 또는 데이터 오류를 확인하세요.` });
+    if (Number.isFinite(finance.pb) && finance.pb > 80) warnings.push({ level: "warn", label: "PBR 이상치", summary: `PBR ${finance.pb.toFixed(1)}은 매우 높습니다. 자본잠식/데이터 단위를 확인하세요.` });
+    if (Number.isFinite(finance.roe) && Math.abs(finance.roe) > 1.5) warnings.push({ level: "warn", label: "ROE 이상치", summary: `ROE ${(finance.roe * 100).toFixed(1)}%는 매우 큽니다. 최근 순이익/자본 변동을 확인하세요.` });
+    if (Number.isFinite(finance.eps) && finance.eps <= 0 && Number.isFinite(finance.pe) && finance.pe > 0) warnings.push({ level: "warn", label: "EPS/PER 충돌", summary: "EPS가 0 이하인데 PER이 양수입니다. 공급 API 기준이 다른지 확인하세요." });
+  }
+  if (Number.isFinite(finance.target) && Number.isFinite(price) && Math.abs((finance.target / price - 1) * 100) > 200) {
+    warnings.push({ level: "warn", label: "목표가 이상치", summary: "목표가와 현재가 괴리가 200%를 넘습니다. 통화/분할조정 오류 가능성을 확인하세요." });
+  }
+  const rsiValue = Number(scored.finance?.rsi);
+  if (Number.isFinite(rsiValue) && (rsiValue < 0 || rsiValue > 100)) warnings.push({ level: "critical", label: "RSI 오류", summary: "RSI가 0~100 범위를 벗어났습니다." });
+  return warnings;
 }
 
 function percent(part, total) {
@@ -627,8 +760,120 @@ function readRequestJson(req, maxBytes = 1_000_000) {
   });
 }
 
+function cleanStoredStock(stock) {
+  if (!stock || typeof stock !== "object" || !stock.ticker) return null;
+  const ticker = String(stock.ticker || "").trim().toUpperCase();
+  if (!/^[A-Z0-9.-]{1,16}$/.test(ticker)) return null;
+  return {
+    ...stock,
+    ticker,
+    yf_symbol: stock.yf_symbol || stock.yfSymbol || ticker,
+    savedAt: stock.savedAt || new Date().toISOString()
+  };
+}
+
+async function readScannedStocks() {
+  if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    const result = await supabaseRest(`${SUPABASE_SCANNED_TABLE}?select=ticker,payload,updated_at&order=updated_at.desc&limit=80`);
+    if (result.ok && Array.isArray(result.payload)) {
+      return result.payload
+        .map((row) => cleanStoredStock({ ...(row.payload || {}), ticker: row.ticker, savedAt: row.updated_at }))
+        .filter(Boolean)
+        .slice(0, 80);
+    }
+  }
+  try {
+    const raw = JSON.parse((await readFile(SCANNED_STOCKS_FILE, "utf8")).replace(/^\uFEFF/, ""));
+    return Array.isArray(raw?.items)
+      ? raw.items.map(cleanStoredStock).filter(Boolean).slice(0, 80)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeScannedStocks(items) {
+  const cleanItems = items.map(cleanStoredStock).filter(Boolean).slice(0, 80);
+  if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY && cleanItems.length) {
+    const result = await supabaseRest(`${SUPABASE_SCANNED_TABLE}?on_conflict=ticker`, {
+      method: "POST",
+      headers: { prefer: "resolution=merge-duplicates,return=minimal" },
+      body: cleanItems.map((item) => ({
+        ticker: item.ticker,
+        payload: item,
+        updated_at: new Date().toISOString()
+      }))
+    });
+    if (result.ok) return;
+  }
+  try {
+    await mkdir(CACHE_DIR, { recursive: true });
+    await writeFile(SCANNED_STOCKS_FILE, JSON.stringify({
+      savedAt: new Date().toISOString(),
+      items: cleanItems
+    }));
+  } catch (error) {
+    if (error?.code !== "EROFS" && error?.code !== "EACCES" && error?.code !== "EPERM") throw error;
+  }
+}
+
+function mergeServerStocks(current, incoming) {
+  const merged = [...(current || [])];
+  for (const item of incoming || []) {
+    const clean = cleanStoredStock(item);
+    if (!clean) continue;
+    const index = merged.findIndex((stock) => String(stock.ticker).toUpperCase() === clean.ticker);
+    if (index >= 0) merged[index] = { ...merged[index], ...clean };
+    else merged.unshift(clean);
+  }
+  return merged;
+}
+
+async function rememberServerScannedStocks(items) {
+  const incoming = (items || []).map(cleanStoredStock).filter(Boolean);
+  if (!incoming.length) return [];
+  const merged = mergeServerStocks(await readScannedStocks(), incoming).slice(0, 80);
+  await writeScannedStocks(merged);
+  return merged;
+}
+
 function validPortfolioClientId(clientId) {
   return /^[a-zA-Z0-9._:-]{8,120}$/.test(String(clientId || ""));
+}
+
+function portfolioTokenHash(clientId, token) {
+  const cleanToken = String(token || "").trim();
+  if (!/^[a-zA-Z0-9._:-]{16,160}$/.test(cleanToken)) return null;
+  return createHash("sha256").update(`${clientId}:${cleanToken}`).digest("hex");
+}
+
+function portfolioTokenFromRequest(req, body = {}) {
+  return req.headers["x-portfolio-token"] || body.portfolioToken || body.token || "";
+}
+
+function attachPortfolioAuth(clientId, payload, token) {
+  const tokenHash = portfolioTokenHash(clientId, token);
+  if (!tokenHash) return null;
+  return {
+    ...payload,
+    cloudAuth: {
+      version: 1,
+      tokenHash,
+      updatedAt: new Date().toISOString()
+    }
+  };
+}
+
+function stripPortfolioAuth(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload || null;
+  const { cloudAuth, ...safePayload } = payload;
+  return safePayload;
+}
+
+function portfolioAuthMatches(clientId, payload, token) {
+  const savedHash = payload?.cloudAuth?.tokenHash;
+  if (!savedHash) return true;
+  return portfolioTokenHash(clientId, token) === savedHash;
 }
 
 function clamp(value, low = 0, high = 100) {
@@ -851,6 +1096,7 @@ function calculateTradeSetup({ rows, closes, close, atrValue, volumeRatio, highD
   const atrStop = close - atrValue * 1.8;
   const vcpStop = contractionLow * 0.99;
   const stop = Math.max(0, Math.max(atrStop, vcpStop));
+  const stopBasis = atrStop >= vcpStop ? "ATR 1.8배" : "20일 저가 1% 여유";
   const risk = close - stop;
   const target1 = close + risk * 2;
   const target2 = close + risk * 3;
@@ -873,6 +1119,9 @@ function calculateTradeSetup({ rows, closes, close, atrValue, volumeRatio, highD
   return {
     buy: Number(close.toFixed(2)),
     stop: Number(stop.toFixed(2)),
+    stopBasis,
+    atrStop: Number(atrStop.toFixed(2)),
+    vcpStop: Number(vcpStop.toFixed(2)),
     target1: Number(target1.toFixed(2)),
     target2: Number(target2.toFixed(2)),
     atr: Number(atrValue.toFixed(2)),
@@ -1623,15 +1872,51 @@ function alphaSourceStatus(overview, earnings) {
 function fmpSourceStatus(bundle) {
   if (!FMP_API_KEYS.length) return "missing_key";
   if (!bundle) return "fallback";
-  if (bundle.quote && bundle.ratios && (bundle.income?.length || bundle.estimates?.length)) return "ok";
+  if (
+    bundle.quote &&
+    bundle.ratios &&
+    bundle.keyMetrics &&
+    (bundle.income?.length || bundle.estimates?.length) &&
+    (bundle.balance?.length || bundle.cashflow?.length)
+  ) return "ok";
   const coverage = [
     bundle.profile,
     bundle.quote,
     bundle.ratios,
+    bundle.keyMetrics,
     bundle.targetConsensus,
-    bundle.income?.length
+    bundle.income?.length,
+    bundle.balance?.length,
+    bundle.cashflow?.length,
+    bundle.estimates?.length
   ].filter(Boolean).length;
   return coverage > 0 ? "partial" : "fallback";
+}
+
+function fmpBundleHasExpandedCoverage(bundle) {
+  return Boolean(
+    bundle?.schemaVersion >= FMP_BUNDLE_SCHEMA_VERSION &&
+    bundle.quote &&
+    bundle.ratios &&
+    bundle.keyMetrics &&
+    (bundle.income?.length || bundle.estimates?.length) &&
+    (bundle.balance?.length || bundle.cashflow?.length)
+  );
+}
+
+function fundamentalCoverageForSymbol(symbol, sets) {
+  const fmpComplete = sets.fmpComplete.has(symbol);
+  const fmpPartial = sets.fmpPartial.has(symbol);
+  const alphaOverview = sets.overview.has(symbol);
+  const alphaEarnings = sets.earnings.has(symbol);
+  const complete = fmpComplete || (alphaOverview && alphaEarnings);
+  const source = fmpComplete ? "FMP 확장 번들" : alphaOverview && alphaEarnings ? "Alpha overview+earnings" : fmpPartial ? "FMP 부분" : alphaOverview ? "Alpha overview" : alphaEarnings ? "Alpha earnings" : "없음";
+  const missing = [
+    !fmpComplete ? "FMP 확장 번들" : "",
+    !alphaOverview ? "Alpha overview" : "",
+    !alphaEarnings ? "Alpha earnings" : ""
+  ].filter(Boolean);
+  return { symbol, complete, source, fmpComplete, fmpPartial, alphaOverview, alphaEarnings, missing };
 }
 
 function dartSourceStatus(isKr, dart) {
@@ -1766,6 +2051,42 @@ function fmpInstitutionalHolders(insight, ticker) {
       source: "FMP institutional-holder + SEC EDGAR"
     };
   });
+}
+
+function secStructureSummary({ ticker, filings, form4, fmpInsight }) {
+  const filingItems = Array.isArray(filings?.items) ? filings.items : [];
+  const form4Items = fmpInsiderFilings(fmpInsight, form4?.filings || []);
+  const holderItems = fmpInstitutionalHolders(fmpInsight, ticker);
+  const transactionText = form4Items.map((item) => String(item.title || "")).join(" ");
+  const buyCount = (transactionText.match(/\b(P|Buy|Purchase|매수)\b/gi) || []).length;
+  const sellCount = (transactionText.match(/\b(S|Sale|Sell|매도)\b/gi) || []).length;
+  const latestFiling = filingItems[0] || null;
+  const latestForm4 = form4Items[0] || null;
+  const topHolder = holderItems[0] || null;
+  return {
+    sec: {
+      count: filingItems.length,
+      latestForm: latestFiling?.form || "-",
+      latestDate: latestFiling?.date || "-",
+      latestTitle: latestFiling?.title || "최근 공시 없음",
+      url: latestFiling?.url || secSearchUrl(ticker)
+    },
+    form4: {
+      count: form4Items.length,
+      latestDate: latestForm4?.date || "-",
+      latestTitle: latestForm4?.title || "최근 내부자 거래 없음",
+      buyCount,
+      sellCount,
+      url: latestForm4?.url || secSearchUrl(ticker, "4")
+    },
+    institutional13f: {
+      count: holderItems.length,
+      topHolder: topHolder?.holder || "-",
+      topShares: topHolder?.shares || "-",
+      latestDate: topHolder?.date || "-",
+      url: topHolder?.url || secSearchUrl(ticker, "13F-HR")
+    }
+  };
 }
 
 async function secForm4Insight(ticker, cik) {
@@ -1907,26 +2228,33 @@ async function fmpBundle(symbol) {
   const upper = symbol.toUpperCase();
   const cacheKey = `fmp_bundle_${upper}`;
   const cached = await supplementalRead(cacheKey, DAY_MS);
-  if (cached?.quote && cached?.ratios && (cached?.income?.length || cached?.estimates?.length)) return cached;
+  if (fmpBundleHasExpandedCoverage(cached)) return cached;
 
-  const [profile, quote, income, ratios, estimates, targetConsensus] = await Promise.all([
+  const [profile, quote, income, ratios, keyMetrics, balance, cashflow, estimates, targetConsensus] = await Promise.all([
     fetchFmp("profile", { symbol: upper }, `fmp_profile_${upper}`, 7 * DAY_MS).catch(() => null),
     fetchFmp("quote", { symbol: upper }, `fmp_quote_${upper}`, DAY_MS).catch(() => null),
-    fetchFmp("income-statement", { symbol: upper, period: "quarter", limit: "6" }, `fmp_income_q_${upper}`, 7 * DAY_MS).catch(() => null),
+    fetchFmp("income-statement", { symbol: upper, period: "quarter", limit: "8" }, `fmp_income_q_${upper}`, 7 * DAY_MS).catch(() => null),
     fetchFmp("ratios-ttm", { symbol: upper }, `fmp_ratios_ttm_${upper}`, 7 * DAY_MS).catch(() => null),
+    fetchFmp("key-metrics-ttm", { symbol: upper }, `fmp_key_metrics_ttm_${upper}`, 7 * DAY_MS).catch(() => null),
+    fetchFmp("balance-sheet-statement", { symbol: upper, period: "quarter", limit: "4" }, `fmp_balance_q_${upper}`, 7 * DAY_MS).catch(() => null),
+    fetchFmp("cash-flow-statement", { symbol: upper, period: "quarter", limit: "4" }, `fmp_cashflow_q_${upper}`, 7 * DAY_MS).catch(() => null),
     fetchFmp("analyst-estimates", { symbol: upper, period: "quarter", page: "0", limit: "4" }, `fmp_estimates_q_${upper}`, 7 * DAY_MS).catch(() => null),
     fetchFmp("price-target-consensus", { symbol: upper }, `fmp_target_${upper}`, DAY_MS).catch(() => null)
   ]);
   const data = {
+    schemaVersion: FMP_BUNDLE_SCHEMA_VERSION,
     profile: (Array.isArray(profile) ? profile[0] || null : profile) || cached?.profile || null,
     quote: (Array.isArray(quote) ? quote[0] || null : quote) || cached?.quote || null,
     income: Array.isArray(income) && income.length ? income : (cached?.income || []),
     ratios: (Array.isArray(ratios) ? ratios[0] || null : ratios) || cached?.ratios || null,
+    keyMetrics: (Array.isArray(keyMetrics) ? keyMetrics[0] || null : keyMetrics) || cached?.keyMetrics || null,
+    balance: Array.isArray(balance) && balance.length ? balance : (cached?.balance || []),
+    cashflow: Array.isArray(cashflow) && cashflow.length ? cashflow : (cached?.cashflow || []),
     estimates: Array.isArray(estimates) && estimates.length ? estimates : (cached?.estimates || []),
     targetConsensus: (Array.isArray(targetConsensus) ? targetConsensus[0] || null : targetConsensus) || cached?.targetConsensus || null,
     source: sourceStatus("fmp", "ok")
   };
-  if (!data.profile && !data.quote && !data.income.length && !data.ratios && !data.estimates.length && !data.targetConsensus) return null;
+  if (!data.profile && !data.quote && !data.income.length && !data.ratios && !data.keyMetrics && !data.balance.length && !data.cashflow.length && !data.estimates.length && !data.targetConsensus) return null;
   return supplementalWrite(cacheKey, data);
 }
 
@@ -1987,6 +2315,11 @@ function fmpFinanceIndicators(bundle, fallbackRows) {
   const profile = bundle.profile || {};
   const quote = bundle.quote || {};
   const ratios = bundle.ratios || {};
+  const keyMetrics = bundle.keyMetrics || {};
+  const latestIncome = bundle.income?.[0] || {};
+  const previousIncome = bundle.income?.[1] || {};
+  const latestBalance = bundle.balance?.[0] || {};
+  const latestCashflow = bundle.cashflow?.[0] || {};
   const pe = numberField(quote.pe) ?? numberField(ratios.priceToEarningsRatioTTM);
   const pb = numberField(ratios.priceToBookRatioTTM);
   const roe = numberField(ratios.returnOnEquityTTM);
@@ -1996,18 +2329,37 @@ function fmpFinanceIndicators(bundle, fallbackRows) {
   const marketCap = numberField(profile.mktCap) ?? numberField(quote.marketCap);
   const target = fmpTargetPrice(bundle);
   const currency = profile.currency || quote.currency || "USD";
-  return [
+  const evToEbitda = numberField(keyMetrics.enterpriseValueOverEBITDATTM) ?? numberField(keyMetrics.evToEbitdaTTM);
+  const fcfYield = numberField(keyMetrics.freeCashFlowYieldTTM);
+  const currentAssets = numberField(latestBalance.totalCurrentAssets);
+  const currentLiabilities = numberField(latestBalance.totalCurrentLiabilities);
+  const currentRatio = currentAssets !== null && currentLiabilities ? currentAssets / currentLiabilities : numberField(ratios.currentRatioTTM);
+  const freeCashFlow = numberField(latestCashflow.freeCashFlow)
+    ?? ((numberField(latestCashflow.operatingCashFlow) ?? numberField(latestCashflow.netCashProvidedByOperatingActivities)) !== null
+      ? (numberField(latestCashflow.operatingCashFlow) ?? numberField(latestCashflow.netCashProvidedByOperatingActivities)) - Math.abs(numberField(latestCashflow.capitalExpenditure) ?? 0)
+      : null);
+  const revenue = numberField(latestIncome.revenue);
+  const previousRevenue = numberField(previousIncome.revenue);
+  const revenueGrowth = revenue !== null && previousRevenue ? (revenue / previousRevenue) - 1 : null;
+  const compact = (value) => Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
+  const rows = [
     { title: "PER", desc: "주가수익비율 · 낮을수록 저평가 가능성", value: pe === null ? "-" : pe.toFixed(1), status: pe === null ? "neutral" : pe <= 25 ? "good" : pe >= 45 ? "bad" : "neutral", dataStatus: pe === null ? "fallback" : "real", dataSource: "FMP" },
     { title: "PBR", desc: "주가순자산비율", value: pb === null ? "-" : pb.toFixed(1), status: pb === null ? "neutral" : pb <= 3 ? "good" : "neutral", dataStatus: pb === null ? "fallback" : "real", dataSource: "FMP" },
     { title: "ROE", desc: "자기자본이익률 · 17% 이상 선호", value: roe === null ? "-" : `${(roe * 100).toFixed(1)}%`, status: roe !== null && roe >= .17 ? "good" : roe !== null ? "bad" : "neutral", dataStatus: roe === null ? "fallback" : "real", dataSource: "FMP" },
     { title: "EPS", desc: "최근 12개월 주당순이익", value: eps === null ? "-" : eps.toFixed(2), status: eps !== null && eps > 0 ? "good" : "neutral", dataStatus: eps === null ? "fallback" : "real", dataSource: "FMP" },
+    { title: "매출 성장", desc: "최근 분기 매출 전분기 대비", value: revenueGrowth === null ? "-" : `${(revenueGrowth * 100).toFixed(1)}%`, status: revenueGrowth !== null && revenueGrowth >= .1 ? "good" : revenueGrowth !== null && revenueGrowth < 0 ? "bad" : "neutral", dataStatus: revenueGrowth === null ? "fallback" : "real", dataSource: "FMP" },
     { title: "이익률", desc: "순이익률", value: margin === null ? "-" : `${(margin * 100).toFixed(1)}%`, status: margin !== null && margin >= .2 ? "good" : "neutral", dataStatus: margin === null ? "fallback" : "real", dataSource: "FMP" },
     { title: "부채비율", desc: "부채/자본", value: debtEquity === null ? "-" : `${(debtEquity * 100).toFixed(1)}%`, status: debtEquity !== null && debtEquity <= 1 ? "good" : debtEquity !== null && debtEquity >= 2 ? "bad" : "neutral", dataStatus: debtEquity === null ? "fallback" : "real", dataSource: "FMP" },
-    { title: "시가총액", desc: "기업 규모", value: marketCap === null ? "-" : Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(marketCap), status: "neutral", dataStatus: marketCap === null ? "fallback" : "real", dataSource: "FMP" },
+    { title: "유동비율", desc: "단기 지급능력 · 1.5 이상 선호", value: currentRatio === null ? "-" : currentRatio.toFixed(2), status: currentRatio !== null && currentRatio >= 1.5 ? "good" : currentRatio !== null && currentRatio < 1 ? "bad" : "neutral", dataStatus: currentRatio === null ? "fallback" : "real", dataSource: "FMP" },
+    { title: "FCF", desc: "최근 분기 잉여현금흐름", value: freeCashFlow === null ? "-" : compact(freeCashFlow), status: freeCashFlow !== null && freeCashFlow > 0 ? "good" : freeCashFlow !== null ? "bad" : "neutral", dataStatus: freeCashFlow === null ? "fallback" : "real", dataSource: "FMP" },
+    { title: "FCF Yield", desc: "잉여현금흐름 수익률", value: fcfYield === null ? "-" : `${(fcfYield * 100).toFixed(1)}%`, status: fcfYield !== null && fcfYield >= .03 ? "good" : "neutral", dataStatus: fcfYield === null ? "fallback" : "real", dataSource: "FMP" },
+    { title: "EV/EBITDA", desc: "기업가치 대비 영업현금창출력", value: evToEbitda === null ? "-" : evToEbitda.toFixed(1), status: evToEbitda !== null && evToEbitda <= 18 ? "good" : evToEbitda !== null && evToEbitda >= 30 ? "bad" : "neutral", dataStatus: evToEbitda === null ? "fallback" : "real", dataSource: "FMP" },
+    { title: "시가총액", desc: "기업 규모", value: marketCap === null ? "-" : compact(marketCap), status: "neutral", dataStatus: marketCap === null ? "fallback" : "real", dataSource: "FMP" },
     { title: "증권사 목표가", desc: "FMP 컨센서스 목표가", value: target === null ? "-" : target.toFixed(2), status: target !== null ? "good" : "neutral", dataStatus: target === null ? "fallback" : "real", dataSource: "FMP" },
     { title: "통화", desc: "거래 통화", value: currency, status: "good", dataStatus: "real", dataSource: "FMP" },
     { title: "데이터 출처", desc: "무료 FMP 데이터", value: "FMP", status: "good", dataStatus: "real", dataSource: "FMP" }
   ];
+  return rows;
 }
 
 function hasRealFinanceIndicator(rows) {
@@ -2258,11 +2610,42 @@ function decodeHtmlEntities(value) {
     .trim();
 }
 
-function newsTone(title) {
+function newsToneScore(title) {
   const text = String(title || "");
-  if (/급등|상승|호실적|최고|강세|돌파|매수|기대|성장|확대|호재|긍정/i.test(text)) return "good";
-  if (/하락|급락|약세|부진|소송|규제|리콜|감원|우려|악재|손실|경고/i.test(text)) return "bad";
-  return "neutral";
+  const positive = [
+    ["호실적", 3], ["어닝 서프라이즈", 3], ["상향", 2], ["목표가 상향", 3], ["매수", 2],
+    ["급등", 2], ["상승", 1], ["최고", 1], ["강세", 1], ["돌파", 1],
+    ["성장", 1], ["확대", 1], ["수주", 2], ["흑자", 2], ["호재", 2], ["긍정", 1]
+  ];
+  const negative = [
+    ["실적 부진", 3], ["어닝 쇼크", 3], ["하향", 2], ["목표가 하향", 3], ["매도", 2],
+    ["급락", 2], ["하락", 1], ["약세", 1], ["소송", 2], ["규제", 2],
+    ["리콜", 3], ["감원", 2], ["우려", 1], ["악재", 2], ["손실", 2], ["경고", 2]
+  ];
+  const score = positive.reduce((sum, [word, weight]) => sum + (text.includes(word) ? weight : 0), 0)
+    - negative.reduce((sum, [word, weight]) => sum + (text.includes(word) ? weight : 0), 0);
+  const reason = score > 0
+    ? "긍정 키워드 우세"
+    : score < 0
+      ? "부정 키워드 우세"
+      : "강한 감성 키워드 없음";
+  return {
+    tone: score >= 2 ? "good" : score <= -2 ? "bad" : "neutral",
+    score,
+    reason
+  };
+}
+
+function newsTone(title) {
+  return newsToneScore(title).tone;
+}
+
+function newsConfidence(items, positive, negative) {
+  if (!items.length) return "데이터 없음";
+  const signalGap = Math.abs(positive - negative);
+  if (items.length >= 8 && signalGap >= 3) return "높음";
+  if (items.length >= 5) return "보통";
+  return "낮음";
 }
 
 async function koreanNewsInsight(meta) {
@@ -2274,17 +2657,26 @@ async function koreanNewsInsight(meta) {
   const url = `https://news.google.com/rss/search?q=${encodeURIComponent(query)}&hl=ko&gl=KR&ceid=KR:ko`;
   try {
     const rss = await fetchText(url, "Mozilla/5.0 StockLens local scanner");
+    const seen = new Set();
     const items = [...rss.matchAll(/<item>([\s\S]*?)<\/item>/g)].map((match) => {
       const item = match[1];
       const title = decodeHtmlEntities(item.match(/<title>([\s\S]*?)<\/title>/)?.[1] || "");
       const link = decodeHtmlEntities(item.match(/<link>([\s\S]*?)<\/link>/)?.[1] || "");
       const source = decodeHtmlEntities(item.match(/<source[^>]*>([\s\S]*?)<\/source>/)?.[1] || "");
+      const tone = newsToneScore(title);
       return {
         title: source && !title.includes(source) ? `${title} · ${source}` : title,
-        tone: newsTone(title),
+        tone: tone.tone,
+        score: tone.score,
+        reason: tone.reason,
         url: link || `https://news.google.com/search?q=${encodeURIComponent(query)}&hl=ko&gl=KR&ceid=KR:ko`
       };
-    }).filter((item) => item.title).slice(0, 5);
+    }).filter((item) => {
+      const key = item.title.replace(/\s+/g, " ").toLowerCase();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }).slice(0, 8);
     const positive = items.filter((item) => item.tone === "good").length;
     const negative = items.filter((item) => item.tone === "bad").length;
     const neutral = Math.max(0, items.length - positive - negative);
@@ -2294,7 +2686,9 @@ async function koreanNewsInsight(meta) {
       neutral,
       negative,
       label: positive > negative ? "긍정" : negative > positive ? "주의" : "중립",
-      source: "Google News RSS"
+      source: "Google News RSS",
+      method: "한글 Google News RSS 제목을 가중 키워드로 점수화하고 중복 제목을 제거",
+      confidence: newsConfidence(items, positive, negative)
     };
     return supplementalWrite(cacheKey, result);
   } catch {
@@ -2364,6 +2758,9 @@ async function enrichDetail(meta, rows, scored) {
     payload.financeIndicators = dartFinanceIndicators(dart, payload.financeIndicators);
   }
   payload.quantFactors = buildQuantMathFactors(meta, rows, scored);
+  const dataCrossChecks = buildDataCrossChecks({ meta, rows, scored, fmp, overview });
+  const anomalyWarnings = buildAnomalyWarnings({ meta, rows, scored, fmp, overview });
+  const issueCount = dataCrossChecks.warnCount + anomalyWarnings.filter((item) => item.level !== "info").length;
   const fmpRows = fmp ? fmpEarningsRows(fmp) : [];
   const earningsRows = fmpRows.length ? fmpRows : alphaEarningsRows(earnings);
   const sources = {
@@ -2381,7 +2778,9 @@ async function enrichDetail(meta, rows, scored) {
     ...scored,
     ...payload,
     sourceStatus: sources,
-    trust: trustSummary(sources),
+    trust: trustSummary(sources, { issueCount }),
+    dataCrossChecks,
+    anomalyWarnings,
     chart: chartRows(rows, 120, scored.price).map((row) => row.close),
     chartRows: chartRows(rows, 120, scored.price),
     usInsight: isKr ? null : {
@@ -2395,6 +2794,9 @@ async function enrichDetail(meta, rows, scored) {
         positive: newsInsight?.positive ?? (scored.entry >= 60 ? 6 : 3),
         neutral: newsInsight?.neutral ?? 4,
         negative: newsInsight?.negative ?? (scored.entry < 40 ? 3 : 1),
+        method: newsInsight?.method || "가격/거래량 기반 대체 감성 추정",
+        confidence: newsInsight?.confidence || (newsInsight?.items?.length ? "낮음" : "대체 계산"),
+        source: newsInsight?.source || "모델 대체값",
         summary: `${meta.ticker}는 가격과 거래량 기준으로 TotalScore ${scored.score}, EntryScore ${scored.entry}입니다. ${newsInsight?.source ? `대표 한글 뉴스 ${newsInsight.items.length}건을 함께 확인했습니다.` : canUseStockFundamentals ? earningsSourceText : "ETF는 가격·추세 중심으로 평가합니다."}${fmp ? " FMP 무료 API로 재무·목표가 데이터를 보강했습니다." : overview ? " Alpha Vantage 무료 API로 재무 데이터를 보강했습니다." : ""}`,
         items: newsInsight?.items?.length ? newsInsight.items : [
           { title: `${meta.ticker} 가격 추세와 어닝 일정 확인`, tone: "neutral", url: `https://news.google.com/search?q=${encodeURIComponent(`${meta.ticker} 주가 어닝`)}` },
@@ -2409,6 +2811,7 @@ async function enrichDetail(meta, rows, scored) {
       ],
       institutionalHolders: fmpInstitutionalHolders(fmpInsight, meta.ticker),
       insiderFilings: fmpInsiderFilings(fmpInsight, form4?.filings || []),
+      filingSummary: secStructureSummary({ ticker: meta.ticker, filings, form4, fmpInsight }),
       filings
     },
     krInsight: isKr ? {
@@ -2487,11 +2890,12 @@ async function enrichListSummary(scored) {
   return scored;
 }
 
-async function cacheRead(key) {
+async function cacheRead(key, minRows = 1) {
   const path = join(CACHE_DIR, `${key}.json`);
   if (!existsSync(path)) return null;
   const raw = JSON.parse((await readFile(path, "utf8")).replace(/^\uFEFF/, ""));
   if (!raw.rows?.length) return null;
+  if (raw.rows.length < minRows) return null;
   if (Date.now() - raw.savedAt > PRICE_CACHE_MS) return null;
   const rows = raw.rows;
   if (raw.source) rows.source = raw.source;
@@ -2569,7 +2973,7 @@ async function rawYahooRows(key) {
   try {
     const data = JSON.parse((await readFile(path, "utf8")).replace(/^\uFEFF/, ""));
     const rows = yahooRows(data);
-    if (rows.length) await cacheWrite(key, rows, "yahoo");
+    if (rows.length >= MIN_US_HISTORY_ROWS) await cacheWrite(key, rows, "yahoo");
     return rows;
   } catch {
     return null;
@@ -2639,15 +3043,15 @@ async function rawNaverRows(code) {
 
 async function loadYahoo(symbol) {
   const key = symbol.replace(/[^A-Z0-9]/gi, "_");
-  const cached = await cacheRead(key);
+  const cached = await cacheRead(key, MIN_US_HISTORY_ROWS);
   if (cached) return cached;
   const rawRows = await rawYahooRows(key);
-  if (rawRows?.length) return rawRows;
+  if (rawRows?.length >= MIN_US_HISTORY_ROWS) return rawRows;
   try {
     const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=3y&interval=1d`;
     const data = await fetchJson(url);
     const rows = yahooRows(data);
-    if (rows.length) {
+    if (rows.length >= MIN_US_HISTORY_ROWS) {
       await cacheWrite(key, rows, "yahoo");
       return rows;
     }
@@ -2658,7 +3062,7 @@ async function loadYahoo(symbol) {
     const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=3mo&interval=1d`;
     const data = await fetchJson(url, "Mozilla/5.0");
     const rows = yahooRows(data);
-    if (rows.length) {
+    if (rows.length >= MIN_US_HISTORY_ROWS) {
       await cacheWrite(key, rows, "yahooQuery2");
       return rows;
     }
@@ -2666,7 +3070,7 @@ async function loadYahoo(symbol) {
     // Alpha Vantage is the final configured fallback.
   }
   const alphaRows = await loadAlphaDaily(symbol);
-  if (alphaRows.length) {
+  if (alphaRows.length >= MIN_US_HISTORY_ROWS) {
     await cacheWrite(key, alphaRows, "alphaVantage");
     return alphaRows;
   }
@@ -2831,7 +3235,17 @@ async function apiStocks(req, res, url) {
       errors.push({ ticker: security.ticker, error: error.message });
     }
   }
-  json(res, 200, { items, errors, generatedAt: new Date().toISOString() });
+  const mergedItems = query ? items : mergeServerStocks(items, await readScannedStocks());
+  json(res, 200, { items: mergedItems, errors, generatedAt: new Date().toISOString() });
+}
+
+async function apiScannedStocks(req, res) {
+  if (req.method === "OPTIONS") return cors(res);
+  if (req.method === "GET") return json(res, 200, { ok: true, items: await readScannedStocks() });
+  if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" });
+  const body = await readRequestJson(req);
+  const items = await rememberServerScannedStocks(body.items || []);
+  return json(res, 200, { ok: true, items, count: items.length });
 }
 
 async function apiHealth(req, res) {
@@ -2913,7 +3327,10 @@ async function apiPortfolio(req, res, url) {
     if (!result.configured) return json(res, 200, { ok: false, configured: false, error: result.payload.error });
     if (!result.ok) return json(res, result.status, { ok: false, configured: true, error: result.payload });
     const row = Array.isArray(result.payload) ? result.payload[0] : null;
-    return json(res, 200, { ok: true, configured: true, portfolio: row?.payload || null, updatedAt: row?.updated_at || null });
+    if (row?.payload && !portfolioAuthMatches(clientId, row.payload, portfolioTokenFromRequest(req))) {
+      return json(res, 403, { ok: false, configured: true, error: "포트폴리오 접근 토큰이 일치하지 않습니다." });
+    }
+    return json(res, 200, { ok: true, configured: true, portfolio: stripPortfolioAuth(row?.payload), updatedAt: row?.updated_at || null });
   }
   if (req.method === "POST" || req.method === "PUT") {
     const body = await readRequestJson(req);
@@ -2923,12 +3340,24 @@ async function apiPortfolio(req, res, url) {
     if (!portfolioPayload || typeof portfolioPayload !== "object" || Array.isArray(portfolioPayload)) {
       return json(res, 400, { error: "portfolio payload가 필요합니다." });
     }
+    const token = portfolioTokenFromRequest(req, body);
+    const securedPayload = attachPortfolioAuth(clientId, portfolioPayload, token);
+    if (!securedPayload) return json(res, 401, { ok: false, configured: true, error: "포트폴리오 접근 토큰이 필요합니다." });
+    const existing = await supabaseRest(`${SUPABASE_PORTFOLIO_TABLE}?client_id=eq.${encodeURIComponent(clientId)}&select=payload&limit=1`);
+    if (existing.configured && existing.ok) {
+      const existingRow = Array.isArray(existing.payload) ? existing.payload[0] : null;
+      if (existingRow?.payload && !portfolioAuthMatches(clientId, existingRow.payload, token)) {
+        return json(res, 403, { ok: false, configured: true, error: "포트폴리오 접근 토큰이 일치하지 않습니다." });
+      }
+    } else if (existing.configured && !existing.ok) {
+      return json(res, existing.status, { ok: false, configured: true, error: existing.payload });
+    }
     const result = await supabaseRest(`${SUPABASE_PORTFOLIO_TABLE}?on_conflict=client_id`, {
       method: "POST",
       headers: { prefer: "resolution=merge-duplicates,return=representation" },
       body: [{
         client_id: clientId,
-        payload: portfolioPayload,
+        payload: securedPayload,
         updated_at: new Date().toISOString()
       }]
     });
@@ -2955,15 +3384,60 @@ function snapshotPayload(stock) {
     dataSource: stock.dataSource,
     trust: stock.trust || null,
     sourceStatus: stock.sourceStatus || null,
+    dataCrossChecks: stock.dataCrossChecks || null,
+    anomalyWarnings: stock.anomalyWarnings || [],
     tradePlan: stock.tradePlan ? {
       buy: stock.tradePlan.buy,
       stop: stock.tradePlan.stop,
+      stopBasis: stock.tradePlan.stopBasis,
+      atrStop: stock.tradePlan.atrStop,
+      vcpStop: stock.tradePlan.vcpStop,
       target1: stock.tradePlan.target1,
       target2: stock.tradePlan.target2,
       riskPct: stock.tradePlan.riskPct,
       setupState: stock.tradePlan.setupState
     } : null
   };
+}
+
+function snapshotMetric(payload = {}) {
+  return {
+    price: Number(payload.price),
+    score: Number(payload.score),
+    entry: Number(payload.entry),
+    stop: Number(payload.tradePlan?.stop)
+  };
+}
+
+function metricDelta(current, previous, key) {
+  const left = Number(current?.[key]);
+  const right = Number(previous?.[key]);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return null;
+  return Number((left - right).toFixed(2));
+}
+
+function enrichSnapshotDeltas(items) {
+  const groups = new Map();
+  for (const item of items || []) {
+    const ticker = String(item.ticker || item.payload?.ticker || "").toUpperCase();
+    if (!ticker) continue;
+    if (!groups.has(ticker)) groups.set(ticker, []);
+    groups.get(ticker).push(item);
+  }
+  for (const rows of groups.values()) {
+    rows.sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+    for (let index = 0; index < rows.length; index += 1) {
+      const current = snapshotMetric(rows[index].payload);
+      const previous = index > 0 ? snapshotMetric(rows[index - 1].payload) : null;
+      rows[index].delta = previous ? {
+        price: metricDelta(current, previous, "price"),
+        score: metricDelta(current, previous, "score"),
+        entry: metricDelta(current, previous, "entry"),
+        stop: metricDelta(current, previous, "stop")
+      } : null;
+    }
+  }
+  return items;
 }
 
 function defaultSnapshotTickers() {
@@ -2983,6 +3457,92 @@ function cleanSnapshotTickers(tickers, limit = 50) {
     .map((ticker) => String(ticker || "").trim().toUpperCase())
     .filter(Boolean))]
     .slice(0, limit);
+}
+
+function cleanEnrichmentTickers(tickers, limit = ENRICHMENT_BATCH_LIMIT) {
+  return [...new Set((tickers || [])
+    .map((ticker) => String(ticker || "").trim().toUpperCase())
+    .filter((ticker) => /^[A-Z0-9.-]{1,16}$/.test(ticker)))]
+    .slice(0, limit);
+}
+
+function enrichmentSnapshot(limit = 30) {
+  const items = [...enrichmentStatus.entries()]
+    .map(([ticker, status]) => ({ ticker, ...status }))
+    .sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+    .slice(0, limit);
+  return {
+    running: enrichmentRunning,
+    queued: enrichmentQueue.length,
+    items,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+function enqueueEnrichment(tickers, options = {}) {
+  const accepted = [];
+  for (const ticker of cleanEnrichmentTickers(tickers)) {
+    const current = enrichmentStatus.get(ticker);
+    if (current?.state === "queued" || current?.state === "running") continue;
+    if (enrichmentQueue.length >= ENRICHMENT_QUEUE_LIMIT) break;
+    enrichmentQueue.push(ticker);
+    enrichmentStatus.set(ticker, {
+      state: "queued",
+      label: "보강 대기",
+      updatedAt: new Date().toISOString()
+    });
+    accepted.push(ticker);
+  }
+  if (accepted.length && options.start !== false) setTimeout(processEnrichmentQueue, 0);
+  return accepted;
+}
+
+async function processEnrichmentQueue() {
+  if (enrichmentRunning) return;
+  enrichmentRunning = true;
+  while (enrichmentQueue.length) {
+    const ticker = enrichmentQueue.shift();
+    enrichmentStatus.set(ticker, {
+      state: "running",
+      label: "데이터 보강 중",
+      updatedAt: new Date().toISOString()
+    });
+    try {
+      const security = await resolveSecurity(ticker);
+      if (!security) throw new Error("unknown ticker");
+      const rows = await loadHistory(security);
+      const detail = await enrichDetail(security, rows, scoreSecurity(security, rows));
+      enrichmentStatus.set(ticker, {
+        state: "done",
+        label: detail.trust?.label === "높음" ? "보강 완료" : "부분 보강",
+        trust: detail.trust?.label || "보통",
+        sourceStatus: detail.sourceStatus || null,
+        priceRows: rows.length,
+        updatedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      enrichmentStatus.set(ticker, {
+        state: "error",
+        label: "보강 실패",
+        error: error.message,
+        updatedAt: new Date().toISOString()
+      });
+    }
+  }
+  enrichmentRunning = false;
+}
+
+async function apiEnrichment(req, res) {
+  if (req.method === "OPTIONS") return cors(res);
+  if (req.method === "GET") return json(res, 200, enrichmentSnapshot());
+  if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" });
+  const body = await readRequestJson(req);
+  const accepted = enqueueEnrichment(body.tickers || [], { start: body.start !== false });
+  return json(res, 200, {
+    ok: true,
+    accepted,
+    ...enrichmentSnapshot()
+  });
 }
 
 async function buildSnapshotRows(tickers, limit = 50) {
@@ -3036,7 +3596,8 @@ async function apiSnapshots(req, res, url) {
     const result = await supabaseRest(`${SUPABASE_SNAPSHOT_TABLE}?${filter}select=ticker,market,payload,created_at&order=created_at.desc&limit=${limit}`);
     if (!result.configured) return json(res, 200, { ok: false, configured: false, items: [], error: result.payload.error });
     if (!result.ok) return json(res, result.status, { ok: false, configured: true, items: [], error: result.payload });
-    return json(res, 200, { ok: true, configured: true, items: Array.isArray(result.payload) ? result.payload : [] });
+    const items = Array.isArray(result.payload) ? result.payload : [];
+    return json(res, 200, { ok: true, configured: true, items: enrichSnapshotDeltas(items) });
   }
   if (req.method === "POST") {
     const body = await readRequestJson(req);
@@ -3047,6 +3608,65 @@ async function apiSnapshots(req, res, url) {
     return json(res, saved.status || 200, saved);
   }
   return json(res, 405, { error: "Method not allowed" });
+}
+
+async function readBacktestHistory() {
+  try {
+    const raw = JSON.parse((await readFile(join(CACHE_DIR, "backtest_runs.json"), "utf8")).replace(/^\uFEFF/, ""));
+    return Array.isArray(raw.items) ? raw.items : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeBacktestHistory(items) {
+  await mkdir(CACHE_DIR, { recursive: true });
+  await writeFile(join(CACHE_DIR, "backtest_runs.json"), JSON.stringify({ savedAt: Date.now(), items: items.slice(-BACKTEST_HISTORY_LIMIT) }));
+}
+
+function backtestRunSummary(payload) {
+  const best = payload.entryCalibration || null;
+  const hybrid = (payload.results || []).find((row) => row.name === "V4_HYBRID") || null;
+  return {
+    generatedAt: payload.generatedAt,
+    market: payload.market,
+    status: payload.status,
+    params: payload.params,
+    coverage: payload.coverage,
+    reliability: payload.backtestReliability,
+    recommendedBand: best?.recommendedBand || null,
+    recommendedEdge: best?.edge ?? null,
+    recommendedSamples: best?.samples ?? null,
+    hybridEdge: hybrid?.edge ?? null,
+    hybridSamples: hybrid?.samples ?? null
+  };
+}
+
+function attachBacktestHistoryDelta(history) {
+  return history.map((item, index) => {
+    const previous = index > 0 ? history[index - 1] : null;
+    return {
+      ...item,
+      delta: previous ? {
+        recommendedEdge: metricDelta({ value: item.recommendedEdge }, { value: previous.recommendedEdge }, "value"),
+        hybridEdge: metricDelta({ value: item.hybridEdge }, { value: previous.hybridEdge }, "value"),
+        evaluatedPoints: metricDelta({ value: item.coverage?.evaluatedPoints }, { value: previous.coverage?.evaluatedPoints }, "value")
+      } : null
+    };
+  });
+}
+
+async function saveBacktestRun(payload) {
+  const history = await readBacktestHistory();
+  const next = [...history, backtestRunSummary(payload)].slice(-BACKTEST_HISTORY_LIMIT);
+  await writeBacktestHistory(next);
+  return attachBacktestHistoryDelta(next);
+}
+
+async function apiBacktestHistory(req, res) {
+  if (req.method !== "GET") return json(res, 405, { error: "Method not allowed" });
+  const history = attachBacktestHistoryDelta(await readBacktestHistory());
+  return json(res, 200, { ok: true, items: history.slice().reverse(), limit: BACKTEST_HISTORY_LIMIT });
 }
 
 async function apiCronDailySnapshot(req, res, url) {
@@ -3106,8 +3726,18 @@ async function apiCacheStatus(req, res) {
       try {
         const raw = JSON.parse((await readFile(join(CACHE_DIR, file), "utf8")).replace(/^\uFEFF/, ""));
         const data = raw?.data || {};
-        const coverage = [data.profile, data.quote, data.ratios, data.targetConsensus, data.income?.length].filter(Boolean).length;
-        if (coverage >= 3) fmpCompleteSymbols.push(symbol);
+        const coverage = [
+          data.profile,
+          data.quote,
+          data.ratios,
+          data.keyMetrics,
+          data.targetConsensus,
+          data.income?.length,
+          data.balance?.length,
+          data.cashflow?.length,
+          data.estimates?.length
+        ].filter(Boolean).length;
+        if (coverage >= 6) fmpCompleteSymbols.push(symbol);
         else if (coverage > 0) fmpPartialSymbols.push(symbol);
       } catch {
         // Ignore malformed supplemental cache files.
@@ -3124,6 +3754,13 @@ async function apiCacheStatus(req, res) {
   const usStockSymbols = UNIVERSE
     .filter((item) => item.market === "us" && item.asset_type !== "etf")
     .map((item) => item.ticker.toUpperCase());
+  const coverageSets = {
+    fmpComplete: new Set(fmpCompleteSymbols),
+    fmpPartial: new Set(fmpPartialSymbols),
+    overview: new Set(overviewSymbols),
+    earnings: new Set(earningsSymbols)
+  };
+  const fundamentalCoverage = usStockSymbols.map((symbol) => fundamentalCoverageForSymbol(symbol, coverageSets));
   const dataQuality = dataQualitySummary({
     priceFiles,
     fmpCompleteSymbols,
@@ -3146,6 +3783,12 @@ async function apiCacheStatus(req, res) {
       overview: overviewSymbols.length,
       earnings: earningsSymbols.length,
       both: usStockSymbols.filter((symbol) => fmpCompleteSymbols.includes(symbol) || (overviewSymbols.includes(symbol) && earningsSymbols.includes(symbol))).length
+    },
+    fundamentalCoverage,
+    nextFundamentalPlan: {
+      command: "node preload_fundamentals.mjs --limit=80 --alpha",
+      prioritySymbols: fundamentalCoverage.filter((item) => !item.complete).slice(0, 20).map((item) => item.symbol),
+      note: "FMP 한도 초과 시 Alpha overview/earnings와 기존 FMP 부분 캐시를 먼저 사용합니다."
     },
     alphaQuota,
     priceSources: priceFiles.reduce((acc, item) => {
@@ -3318,8 +3961,20 @@ async function apiBacktest(req, res, url) {
   } : null;
   const totalSamples = results.reduce((sum, row) => sum + row.samples, 0);
   const entrySamples = entryResults.reduce((sum, row) => sum + row.samples, 0);
+  const requiredSecurities = 10;
+  const requiredEvaluatedPoints = 500;
+  const meetsSampleRule = loaded >= requiredSecurities && evaluatedPoints >= requiredEvaluatedPoints;
+  const backtestReliability = {
+    label: meetsSampleRule && entryCalibration?.edge > 0 ? "보통" : evaluatedPoints >= 100 ? "낮음" : "준비중",
+    sampleRule: "최소 10종목·500평가시점 이상이면 베타 검증에 사용",
+    requiredSecurities,
+    requiredEvaluatedPoints,
+    meetsSampleRule,
+    lookaheadBlocked: true,
+    caveat: "거래비용, 슬리피지, 세금은 아직 반영하지 않았습니다."
+  };
 
-  json(res, 200, {
+  const responsePayload = {
     market,
     status: totalSamples || entrySamples ? (errors.length ? "partial" : "ok") : "no_samples",
     source: "local",
@@ -3335,10 +3990,14 @@ async function apiBacktest(req, res, url) {
     results: totalSamples ? results : [],
     entryBuckets: entrySamples ? entryResults : [],
     entryCalibration,
+    backtestReliability,
     errors,
     message: totalSamples || entrySamples ? "실제 로컬 가격 데이터로 계산한 샘플링 백테스트입니다." : "가격 데이터는 로드됐지만 조건에 맞는 백테스트 샘플이 없습니다.",
     generatedAt: new Date().toISOString()
-  });
+  };
+  const history = await saveBacktestRun(responsePayload).catch(() => []);
+  responsePayload.backtestHistory = history.slice(-5).reverse();
+  json(res, 200, responsePayload);
 }
 
 async function apiStockDetail(req, res, ticker) {
@@ -3382,10 +4041,13 @@ export async function handleRequest(req, res) {
     if (url.pathname === "/api/health") return apiHealth(req, res);
     if (url.pathname === "/api/exchange/usd-krw") return apiExchangeRate(req, res);
     if (url.pathname === "/api/cache/status") return apiCacheStatus(req, res);
+    if (url.pathname === "/api/enrichment") return apiEnrichment(req, res);
     if (url.pathname === "/api/portfolio") return apiPortfolio(req, res, url);
     if (url.pathname === "/api/snapshots") return apiSnapshots(req, res, url);
     if (url.pathname === "/api/cron/daily-snapshot") return apiCronDailySnapshot(req, res, url);
+    if (url.pathname === "/api/backtest/history") return apiBacktestHistory(req, res);
     if (url.pathname === "/api/backtest") return apiBacktest(req, res, url);
+    if (url.pathname === "/api/scanned") return apiScannedStocks(req, res);
     if (url.pathname === "/api/stocks") return apiStocks(req, res, url);
     const detail = url.pathname.match(/^\/api\/stocks\/([^/]+)$/);
     if (detail) return apiStockDetail(req, res, detail[1]);

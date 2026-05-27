@@ -20,7 +20,11 @@ let scanCount = 0;
 let apiMode = false;
 let modalChartInstance = null;
 let searchResultTickers = new Set();
+let activeQuickFilter = "all";
+let scanHistory = [];
+let scanScoreChanges = new Map();
 const STOCK_LOAD_TIMEOUT_MS = 45000;
+const ENRICHMENT_POLL_MS = 8000;
 let portfolio = {
   accountSize: 10000,
   holdings: [],
@@ -30,6 +34,13 @@ let portfolio = {
 const portfolioQuotes = new Map();
 const PORTFOLIO_STORAGE_KEY = "canslimPortfolio.v1";
 const PORTFOLIO_CLIENT_ID_KEY = "canslimPortfolio.clientId.v1";
+const PORTFOLIO_ACCESS_TOKEN_KEY = "canslimPortfolio.accessToken.v1";
+const WATCHLIST_STORAGE_KEY = "canslimWatchlist.v1";
+const SCAN_HISTORY_STORAGE_KEY = "canslimScanHistory.v1";
+const SCANNED_STOCKS_STORAGE_KEY = "canslimScannedStocks.v1";
+let watchlist = new Set();
+let enrichmentPollTimer = null;
+let enrichmentPollCount = 0;
 
 const usInsights = {
   earningsDate: "-",
@@ -103,6 +114,223 @@ function visibleStocks() {
   });
 }
 
+function loadWatchlist() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(WATCHLIST_STORAGE_KEY) || "[]");
+    watchlist = new Set(Array.isArray(parsed) ? parsed.map((ticker) => String(ticker).toUpperCase()).filter(Boolean) : []);
+  } catch {
+    watchlist = new Set();
+  }
+}
+
+function saveWatchlist() {
+  localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify([...watchlist].sort()));
+}
+
+function loadScanHistory() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SCAN_HISTORY_STORAGE_KEY) || "[]");
+    scanHistory = Array.isArray(parsed) ? parsed.slice(-30) : [];
+  } catch {
+    scanHistory = [];
+  }
+}
+
+function saveScanHistory() {
+  localStorage.setItem(SCAN_HISTORY_STORAGE_KEY, JSON.stringify(scanHistory.slice(-30)));
+}
+
+function loadScannedStocks() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SCANNED_STOCKS_STORAGE_KEY) || "[]");
+    return Array.isArray(parsed)
+      ? parsed.filter((stock) => stock?.ticker).map(normalizeApiStock).slice(0, 80)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function rememberScannedStocks(items) {
+  const incoming = (items || []).filter((stock) => stock?.ticker).map((stock) => ({
+    ...normalizeApiStock(stock),
+    savedAt: new Date().toISOString()
+  }));
+  if (!incoming.length) return;
+  const merged = mergeStockResults(loadScannedStocks(), incoming).slice(0, 80);
+  localStorage.setItem(SCANNED_STOCKS_STORAGE_KEY, JSON.stringify(merged));
+  if (canUseApi) {
+    fetch("/api/scanned", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ items: incoming })
+    }).catch(() => {});
+  }
+}
+
+function enrichmentTickersFrom(items) {
+  return [...new Set((items || [])
+    .map((stock) => String(stock?.ticker || "").trim().toUpperCase())
+    .filter((ticker) => /^[A-Z0-9.-]{1,16}$/.test(ticker)))]
+    .slice(0, 12);
+}
+
+function renderEnrichmentStatus(payload = {}) {
+  const statusEl = document.querySelector("#enrichmentStatus");
+  if (!statusEl) return;
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const active = items.filter((item) => item.state === "queued" || item.state === "running").length;
+  const done = items.filter((item) => item.state === "done").length;
+  const errors = items.filter((item) => item.state === "error").length;
+  if (!items.length && !payload.queued && !payload.running) {
+    statusEl.textContent = "자동 보강 대기";
+    statusEl.className = "enrichment-status neutral";
+    return;
+  }
+  const latest = items[0];
+  statusEl.innerHTML = `
+    <strong>${payload.running || active ? "데이터 보강 중" : "자동 보강 완료"}</strong>
+    <span>대기 ${payload.queued || 0} · 완료 ${done} · 실패 ${errors}${latest ? ` · 최근 ${escapeHtml(latest.ticker)} ${escapeHtml(latest.label || latest.state)}` : ""}</span>
+  `;
+  statusEl.className = `enrichment-status ${errors ? "warn" : payload.running || active ? "active" : "good"}`;
+}
+
+async function fetchEnrichmentStatus() {
+  if (!canUseApi) return;
+  try {
+    const response = await fetch("/api/enrichment");
+    if (!response.ok) throw new Error(`API ${response.status}`);
+    renderEnrichmentStatus(await response.json());
+  } catch {
+    renderEnrichmentStatus({ items: [{ ticker: "SERVER", state: "error", label: "상태 확인 실패" }] });
+  }
+}
+
+function startEnrichmentPolling() {
+  if (enrichmentPollTimer) return;
+  enrichmentPollCount = 0;
+  enrichmentPollTimer = setInterval(async () => {
+    enrichmentPollCount += 1;
+    await fetchEnrichmentStatus();
+    if (enrichmentPollCount >= 15) {
+      clearInterval(enrichmentPollTimer);
+      enrichmentPollTimer = null;
+    }
+  }, ENRICHMENT_POLL_MS);
+}
+
+async function requestDataEnrichment(items) {
+  if (!canUseApi) return;
+  const tickers = enrichmentTickersFrom(items);
+  if (!tickers.length) return;
+  try {
+    const response = await fetch("/api/enrichment", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tickers })
+    });
+    if (!response.ok) throw new Error(`API ${response.status}`);
+    renderEnrichmentStatus(await response.json());
+    startEnrichmentPolling();
+  } catch {
+    renderEnrichmentStatus({ items: [{ ticker: tickers[0], state: "error", label: "자동 보강 시작 실패" }] });
+  }
+}
+
+function mergeSavedScannedStocks(list) {
+  const saved = loadScannedStocks();
+  return saved.length ? mergeStockResults(list, saved) : list;
+}
+
+async function mergeServerScannedStocks() {
+  if (!canUseApi) return;
+  try {
+    const response = await fetch("/api/scanned");
+    if (!response.ok) throw new Error(`API ${response.status}`);
+    const payload = await response.json();
+    const incoming = Array.isArray(payload.items) ? payload.items.map(normalizeApiStock) : [];
+    if (!incoming.length) return;
+    incoming.forEach((stock) => searchResultTickers.add(stock.ticker));
+    stocks = mergeStockResults(stocks, incoming);
+    renderMarketChips();
+    renderRows();
+  } catch {
+    // 로컬 저장 목록만으로 계속 표시합니다.
+  }
+}
+
+function recordScanHistory(items) {
+  const snapshotItems = (items || [])
+    .filter((stock) => stock?.ticker && Number.isFinite(Number(stock.score)))
+    .map((stock) => ({
+      ticker: stock.ticker,
+      score: Number(stock.score),
+      entry: Number.isFinite(Number(stock.entry)) ? Number(stock.entry) : null,
+      price: Number.isFinite(Number(stock.price)) ? Number(stock.price) : null
+    }));
+  if (!snapshotItems.length) return;
+
+  const previous = scanHistory.at(-1);
+  const previousScores = new Map((previous?.items || []).map((item) => [item.ticker, Number(item.score)]));
+  scanScoreChanges = new Map();
+  for (const item of snapshotItems) {
+    const before = previousScores.get(item.ticker);
+    if (Number.isFinite(before)) {
+      const delta = item.score - before;
+      if (Math.abs(delta) >= 0.1) scanScoreChanges.set(item.ticker, delta);
+    }
+  }
+
+  scanHistory = [...scanHistory, {
+    generatedAt: new Date().toISOString(),
+    market: activeMarket,
+    tickers: snapshotItems.map((item) => item.ticker),
+    items: snapshotItems
+  }].slice(-30);
+  saveScanHistory();
+}
+
+function isWatchedTicker(ticker) {
+  return watchlist.has(String(ticker || "").toUpperCase());
+}
+
+function toggleWatchlist(ticker) {
+  const normalized = String(ticker || "").trim().toUpperCase();
+  if (!normalized) return false;
+  if (watchlist.has(normalized)) {
+    watchlist.delete(normalized);
+  } else {
+    watchlist.add(normalized);
+  }
+  saveWatchlist();
+  updateWatchButton();
+  renderMarketChips();
+  renderRows();
+  return watchlist.has(normalized);
+}
+
+function updateWatchButton() {
+  const button = document.querySelector("#watchButton");
+  if (!button) return;
+  const watched = isWatchedTicker(selectedTicker);
+  button.classList.toggle("active", watched);
+  button.textContent = watched ? "관심 해제" : "관심";
+  button.setAttribute("aria-pressed", String(watched));
+}
+
+function passesQuickFilter(stock) {
+  if (activeQuickFilter === "watchlist") return isWatchedTicker(stock.ticker);
+  if (activeQuickFilter === "entry") return stock.entry >= 60 && stock.entry < 75;
+  if (activeQuickFilter === "strong") return stock.score >= 70 || stock.verdict === "매수";
+  if (activeQuickFilter === "newHigh") {
+    const text = `${stock.mainPoint || ""} ${stock.subPoint || ""} ${reasonTags(stock)}`;
+    return /신고가|52주|돌파/i.test(text);
+  }
+  if (activeQuickFilter === "rsi30") return Number(stock.finance?.rsi) < 30;
+  if (activeQuickFilter === "swing") return stock.score >= 60 && stock.entry >= 50 && stock.entry < 75;
+  return true;
+}
+
 function signalFromEntry(entry) {
   if (entry >= 60 && entry < 75) return "매수";
   if (entry < 40) return "주의";
@@ -157,8 +385,8 @@ function compactTarget(stock, value) {
 
 function scoreDelta(stock, index) {
   if (isMissingData(stock)) return `<span class="score-delta flat">-</span>`;
-  const delta = ((stock.score + stock.entry + index) % 21 - 10) / 10;
-  if (Math.abs(delta) < .2) return `<span class="score-delta flat">-</span>`;
+  const delta = scanScoreChanges.get(stock.ticker);
+  if (!Number.isFinite(delta) || Math.abs(delta) < .1) return `<span class="score-delta flat">-</span>`;
   return `<span class="score-delta ${delta > 0 ? "up" : "down"}">${delta > 0 ? "+" : "-"}${Math.abs(delta).toFixed(1)}</span>`;
 }
 
@@ -233,6 +461,26 @@ function signalBadge(stock) {
       <small>${sweetSpot ? "눌림 후보" : stock.entry < 40 ? "리스크 확인" : overheated ? "추격 확인" : "매집 관찰"}</small>
     </div>
   `;
+}
+
+function renderQuickFilters() {
+  const wrapper = document.querySelector(".quick-filters");
+  if (!wrapper) return;
+  const list = visibleStocks();
+  const filters = [
+    ["all", "전체", list.length],
+    ["watchlist", "관심 리스트", list.filter((stock) => isWatchedTicker(stock.ticker)).length],
+    ["entry", "진입 좋음", list.filter((stock) => stock.entry >= 60 && stock.entry < 75).length],
+    ["strong", "강력 매수", list.filter((stock) => stock.score >= 70 || stock.verdict === "매수").length],
+    ["newHigh", "신고가", list.filter((stock) => /신고가|52주|돌파/i.test(`${stock.mainPoint || ""} ${stock.subPoint || ""} ${reasonTags(stock)}`)).length],
+    ["rsi30", "RSI<30", list.filter((stock) => Number(stock.finance?.rsi) < 30).length],
+    ["swing", "단타 신호", list.filter((stock) => stock.score >= 60 && stock.entry >= 50 && stock.entry < 75).length]
+  ];
+  wrapper.innerHTML = filters.map(([key, label, count]) => `
+    <button class="${activeQuickFilter === key ? "active" : ""}" data-filter="${key}" type="button">
+      ${escapeHtml(label)} <b>${count}</b>
+    </button>
+  `).join("");
 }
 
 function renderSectorRail() {
@@ -319,12 +567,16 @@ function renderMarketChips() {
   const green = list.filter((stock) => stock.score >= 70).length;
   const yellow = list.filter((stock) => stock.score >= 55 && stock.score < 70).length;
   const buy = list.filter((stock) => stock.entry >= 60 && stock.entry < 75).length;
+  const watched = list.filter((stock) => isWatchedTicker(stock.ticker)).length;
   document.querySelector("#marketChips").innerHTML = `
     <span class="chip">스캔 종목 <strong>${list.length}</strong>개</span>
     <span class="chip">진입 후보 <strong>${buy}</strong>개</span>
     <span class="chip">관심 후보 <strong>${yellow + green}</strong>개</span>
+    <span class="chip">내 관심 <strong>${watched}</strong>개</span>
+    <span class="chip">변화 기록 <strong>${scanHistory.length}</strong>회</span>
     <span class="chip">섹터 <strong>${activeSector === "all" ? "전체" : activeSector}</strong></span>
   `;
+  renderQuickFilters();
   renderSectorRail();
 }
 
@@ -332,6 +584,7 @@ function renderRows() {
   const term = searchInput.value.trim().toLowerCase();
   stockRows.innerHTML = "";
   const rows = visibleStocks().filter((stock) => {
+    if (!passesQuickFilter(stock)) return false;
     if (searchResultTickers.has(stock.ticker)) return true;
     const searchOriginal = String(stock.searchOriginal || "").toLowerCase();
     return !term || stock.searchMatched || searchOriginal === term || stock.ticker.toLowerCase().includes(term) || stock.company.toLowerCase().includes(term);
@@ -370,6 +623,7 @@ function renderRows() {
       <td>
         <div class="reason-list">${reasonTags(stock)}</div>
         <div class="source-line">${escapeHtml(stockSourceSummary(stock))}</div>
+        <button class="row-watch-toggle ${isWatchedTicker(stock.ticker) ? "active" : ""}" data-ticker="${stock.ticker}" type="button">${isWatchedTicker(stock.ticker) ? "관심 해제" : "관심 추가"}</button>
         <button class="row-portfolio-add" data-ticker="${stock.ticker}" type="button">포트폴리오 추가</button>
       </td>
     `;
@@ -394,6 +648,15 @@ function mergeStockResults(current, incoming) {
   return merged;
 }
 
+function parseTickerList(value) {
+  return String(value || "")
+    .toUpperCase()
+    .split(/[\s,;]+/)
+    .map((ticker) => ticker.trim())
+    .filter((ticker) => /^[A-Z0-9.-]{1,12}$/.test(ticker))
+    .slice(0, 20);
+}
+
 function getSelectedStock() {
   return stocks.find((stock) => stock.ticker === selectedTicker) || stocks[0];
 }
@@ -402,7 +665,8 @@ async function loadStocks({ sampleDrift = false } = {}) {
   const query = searchInput.value.trim().toUpperCase();
   if (!canUseApi) {
     const real = realStocks();
-    stocks = real ? ensureSearchTicker([...real]) : (sampleDrift ? cloneFallbackWithDrift() : ensureSearchTicker([...sampleUniverse]));
+    const base = real ? ensureSearchTicker([...real]) : (sampleDrift ? cloneFallbackWithDrift() : ensureSearchTicker([...sampleUniverse]));
+    stocks = mergeSavedScannedStocks(base);
     apiMode = Boolean(real);
     renderMarketChips();
     renderRows();
@@ -415,6 +679,25 @@ async function loadStocks({ sampleDrift = false } = {}) {
     const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
     const timer = controller ? setTimeout(() => controller.abort(), STOCK_LOAD_TIMEOUT_MS) : null;
     const safeQuery = query.length <= 40 ? query : "";
+    const tickerList = parseTickerList(safeQuery);
+    if (tickerList.length > 1) {
+      const settled = await Promise.allSettled(tickerList.map((ticker) => fetch(`/api/stocks/${encodeURIComponent(ticker)}`).then((res) => {
+        if (!res.ok) throw new Error(`API ${res.status}`);
+        return res.json();
+      })));
+      const incoming = settled
+        .filter((item) => item.status === "fulfilled")
+        .map((item) => normalizeApiStock(item.value));
+      incoming.forEach((stock) => searchResultTickers.add(stock.ticker));
+      rememberScannedStocks(incoming);
+      requestDataEnrichment(incoming);
+      stocks = mergeStockResults(stocks, incoming);
+      apiMode = incoming.length > 0;
+      renderMarketChips();
+      renderRows();
+      renderPortfolio();
+      return;
+    }
     const queryParam = safeQuery ? `&query=${encodeURIComponent(safeQuery)}` : "";
     const response = await fetch(`/api/stocks?market=${activeMarket}${queryParam}`, controller ? { signal: controller.signal } : {});
     if (timer) clearTimeout(timer);
@@ -423,14 +706,17 @@ async function loadStocks({ sampleDrift = false } = {}) {
     const incoming = payload.items && payload.items.length ? payload.items.map(normalizeApiStock) : [];
     if (safeQuery) {
       incoming.forEach((stock) => searchResultTickers.add(stock.ticker));
+      rememberScannedStocks(incoming);
+      requestDataEnrichment(incoming);
       stocks = mergeStockResults(stocks, incoming);
     } else {
       searchResultTickers = new Set();
-      stocks = incoming;
+      stocks = mergeSavedScannedStocks(incoming);
+      requestDataEnrichment(incoming.slice(0, 12));
     }
     apiMode = Boolean(payload.items && payload.items.length);
   } catch (error) {
-    if (!query && !stocks.length) stocks = [];
+    if (!query && !stocks.length) stocks = loadScannedStocks();
     apiMode = false;
     if (!stocks.length) {
       stockRows.innerHTML = `<tr><td colspan="13">서버 계산이 오래 걸리고 있습니다. 잠시 후 다시 스캔을 눌러 주세요.</td></tr>`;
@@ -441,6 +727,7 @@ async function loadStocks({ sampleDrift = false } = {}) {
   }
   renderMarketChips();
   renderRows();
+  if (!query) mergeServerScannedStocks();
   renderPortfolio();
 }
 
@@ -547,6 +834,7 @@ function renderModal() {
   renderSideStats(stock);
   renderTimingPanel(stock);
   renderChart(stock);
+  updateWatchButton();
   renderTabs();
   renderTabContent();
 }
@@ -849,13 +1137,32 @@ function newsList(items) {
         const title = Array.isArray(item) ? item[0] : item.title;
         const tone = Array.isArray(item) ? item[1] : item.tone;
         const href = Array.isArray(item) ? "" : item.url;
+        const evidence = Array.isArray(item)
+          ? ""
+          : [item.reason, Number.isFinite(Number(item.score)) ? `감성점수 ${Number(item.score) > 0 ? "+" : ""}${Number(item.score)}` : ""].filter(Boolean).join(" · ");
         return `
         <a href="${escapeHtml(href || `https://search.naver.com/search.naver?where=news&query=${encodeURIComponent(title || "")}`)}" target="_blank" rel="noopener">
           <span class="dot ${tone}"></span>
-          ${escapeHtml(title)}
+          <span>
+            ${escapeHtml(title)}
+            ${evidence ? `<small>${escapeHtml(evidence)}</small>` : ""}
+          </span>
         </a>
       `;
       }).join("")}
+    </div>
+  `;
+}
+
+function sentimentEvidence(sentiment) {
+  const source = sentiment?.source || "대체 계산";
+  const method = sentiment?.method || "제목 키워드 기반 분류";
+  const confidence = sentiment?.confidence || "보통";
+  return `
+    <div class="sentiment-evidence">
+      <span>출처 ${escapeHtml(source)}</span>
+      <span>방식 ${escapeHtml(method)}</span>
+      <span>신뢰도 ${escapeHtml(confidence)}</span>
     </div>
   `;
 }
@@ -895,6 +1202,13 @@ function renderKrFilingItems(filings, defaultUrl) {
   }).join("");
 }
 
+function filingImportance(form, title = "") {
+  const text = `${form || ""} ${title || ""}`;
+  if (/10-K|10-Q|8-K|S-1|424B|FORM 4|4\b|분기보고서|사업보고서|반기보고서|주요사항|영업\(잠정\)|단일판매/i.test(text)) return "중요";
+  if (/13F|SC 13|지분|임원|소송|합병|분할|유상증자/i.test(text)) return "확인";
+  return "일반";
+}
+
 function renderSecFilingItems(filings, defaultUrl) {
   return filingItems(filings).map((item) => {
     const date = Array.isArray(item) ? item[0] : item.date;
@@ -902,11 +1216,13 @@ function renderSecFilingItems(filings, defaultUrl) {
     const title = Array.isArray(item) ? item[2] : item.title;
     const href = Array.isArray(item) ? defaultUrl : item.url;
     const source = Array.isArray(item) ? "" : item.source;
+    const importance = filingImportance(form, title);
     return `
       <a href="${escapeHtml(href || defaultUrl)}" target="_blank" rel="noopener">
         <time>${escapeHtml(date || "")}</time>
         <b>${escapeHtml(form || "")}</b>
         <strong>${escapeHtml(title || form || "")}</strong>
+        <em class="filing-importance">${escapeHtml(importance)}</em>
         ${source ? `<em>${escapeHtml(source)}</em>` : ""}
         <span>&rarr;</span>
       </a>
@@ -1070,6 +1386,7 @@ function renderKrInsightLegacyStatic(stock) {
       <article class="intel-card">
         <header class="intel-head"><h3>뉴스 감성분석</h3><span class="status-badge neutral">${escapeHtml(data.sentiment?.label || "중립")}</span></header>
         <p class="sentiment-count">긍정 ${data.sentiment?.positive || 0} · 중립 ${data.sentiment?.neutral || 0} · 부정 ${data.sentiment?.negative || 0}</p>
+        ${sentimentEvidence(data.sentiment)}
         ${sentimentMeter(data.sentiment || { positive: 0, neutral: 1, negative: 0 })}
         <p class="intel-copy">${escapeHtml(data.sentiment?.summary || "국장 뉴스 감성 데이터는 준비 중입니다.")}</p>
         ${newsList(data.sentiment?.items || [])}
@@ -1150,14 +1467,30 @@ const TERM_HELP = {
   "RS 등급": "상대강도 등급입니다. 시장 평균 대비 얼마나 강하게 움직였는지 0~100점으로 봅니다.",
   "RSI (14)": "14일 RSI입니다. 70 이상은 과열, 30 이하는 과매도 구간으로 봅니다.",
   "ADX": "추세 강도 지표입니다. 25 이상이면 방향성과 관계없이 추세가 강하다고 봅니다.",
+  "ATR%": "ATR은 평균 실제 변동폭입니다. ATR%는 현재가 대비 변동폭 비율로, 높을수록 손절폭과 목표가를 더 넓게 잡아야 합니다.",
   "VWAP 거리": "거래량가중평균가격 대비 현재가 위치입니다. VWAP 위에 있으면 수요가 받쳐주는 강세 위치로 봅니다.",
-  "거래량 비율": "최근 거래량을 50일 평균 거래량과 비교한 값입니다. 1배 이상이면 평소보다 거래 참여가 많다는 뜻입니다."
+  "거래량 비율": "최근 거래량을 50일 평균 거래량과 비교한 값입니다. 1배 이상이면 평소보다 거래 참여가 많다는 뜻입니다.",
+  "계좌 규모": "포트폴리오 리스크 계산의 기준 금액입니다. Heat와 최대 단일 리스크는 이 금액 대비 비율로 계산합니다.",
+  "평가 금액": "보유 수량에 현재가를 곱한 현재 포지션 가치의 합계입니다. USD와 KRW 종목은 각각 원 통화 기준으로 표시됩니다.",
+  "오픈 리스크": "현재가에서 손절가까지 하락했을 때 발생할 수 있는 예상 손실 합계입니다. 종목별로 (현재가 - 손절가) × 수량으로 계산합니다.",
+  "포트폴리오 Heat": "전체 오픈 리스크를 계좌 규모로 나눈 값입니다. 대략 6~8% 이상이면 포트폴리오 손절 위험이 높은 편으로 봅니다.",
+  "섹터 집중도": "평가금액 기준으로 가장 큰 섹터가 포트폴리오에서 차지하는 비중입니다. 높을수록 특정 업종에 쏠린 상태입니다.",
+  "최대 단일 리스크": "개별 종목 중 손절 시 계좌에 가장 크게 영향을 주는 리스크 비율입니다. 한 종목의 오픈 리스크 ÷ 계좌 규모로 계산합니다.",
+  "KRW 환산 평가": "미국 주식과 한국 주식을 합쳐 보기 위해 USD 보유금액을 USD/KRW 환율로 환산한 총 평가금액입니다.",
+  "점수 변화": "보유 종목 재스캔 기록을 기준으로 종합점수와 진입점수가 얼마나 변했는지 보여줍니다."
 };
 
 function termLabel(label) {
   const help = TERM_HELP[label];
   if (!help) return escapeHtml(label);
   return `<span class="term-label-text">${escapeHtml(label)}</span><span class="term-help" tabindex="0" aria-label="${escapeHtml(help)}"></span>`;
+}
+
+function hydrateStaticTermHelp() {
+  document.querySelectorAll("[data-term-help]").forEach((el) => {
+    const label = el.dataset.termHelp || el.textContent.trim();
+    el.innerHTML = termLabel(label);
+  });
 }
 
 function detailStats(stock) {
@@ -1340,7 +1673,7 @@ function renderTechnicalContext(stock) {
       <article>
         <span>지표 상태</span>
         <strong>파생 ${derivedCount} · 대체 ${fallbackCount}</strong>
-        <small>RSI, ADX, ATR, VWAP 등은 가격/거래량에서 계산됩니다.</small>
+        <small>초록 배경은 우호적 신호, 검은 배경은 중립/관찰 신호입니다. RSI, ADX, ATR, VWAP 등은 가격/거래량에서 계산됩니다.</small>
       </article>
     </div>
   `;
@@ -1812,11 +2145,56 @@ function sourceStatusLabel(status) {
 function sourceStatusTitle(key, item) {
   const titles = {
     price: "가격",
+    fmp: "FMP",
     alphaVantage: "Alpha Vantage",
     dart: "DART",
-    sec: "SEC"
+    sec: "SEC",
+    finra: "FINRA"
   };
   return titles[key] || item?.source || key;
+}
+
+function sourceTone(status) {
+  if (status === "ok") return "real";
+  if (status === "fallback" || status === "missing_key" || status === "missing") return "fallback";
+  return "derived";
+}
+
+function renderSourcePills(stock) {
+  const entries = Object.entries(stock.sourceStatus || {});
+  if (!entries.length) return "";
+  return `
+    <div class="source-pill-row" aria-label="데이터 연결 상태">
+      ${entries.map(([key, item]) => `
+        <span class="source-pill ${sourceTone(item?.status)}">
+          <b>${escapeHtml(sourceStatusTitle(key, item))}</b>
+          ${escapeHtml(sourceStatusLabel(item?.status))}
+        </span>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderDataCrossChecks(stock) {
+  const checks = stock.dataCrossChecks?.checks || [];
+  const warnings = stock.anomalyWarnings || [];
+  if (!checks.length && !warnings.length) return "";
+  return `
+    <div class="data-audit-list">
+      ${checks.slice(0, 6).map((item) => `
+        <div class="data-audit-row ${item.status === "warn" ? "warn" : "ok"}">
+          <strong>${escapeHtml(item.label)}</strong>
+          <span>${escapeHtml(item.summary)}</span>
+        </div>
+      `).join("")}
+      ${warnings.slice(0, 5).map((item) => `
+        <div class="data-audit-row ${item.level === "critical" ? "critical" : item.level === "info" ? "info" : "warn"}">
+          <strong>${escapeHtml(item.label)}</strong>
+          <span>${escapeHtml(item.summary)}</span>
+        </div>
+      `).join("")}
+    </div>
+  `;
 }
 
 function renderTrustSummary(stock) {
@@ -1829,6 +2207,8 @@ function renderTrustSummary(stock) {
       <strong>${escapeHtml(stock.trust.label)}</strong>
       <small>${escapeHtml(stock.trust.note || "")}</small>
       <small>${escapeHtml(trustCountsText(stock))}</small>
+      ${renderSourcePills(stock)}
+      ${renderDataCrossChecks(stock)}
       ${warning ? `<em>${escapeHtml(warning)}</em>` : ""}
     </article>
   `;
@@ -1853,10 +2233,10 @@ function renderSourceStatus(stock) {
     desc: `${item?.source || key} · 업데이트 ${formatSourceTime(item?.updatedAt)}`,
     value: sourceStatusLabel(item?.status),
     pass: sourceStatusPass(item?.status),
-    dataStatus: item?.status === "ok" ? "real" : item?.status === "fallback" || item?.status === "missing_key" || item?.status === "missing" ? "fallback" : "derived",
+    dataStatus: sourceTone(item?.status),
     dataSource: item?.source || key,
     dataLabel: sourceStatusLabel(item?.status),
-    dataTone: item?.status === "ok" ? "real" : item?.status === "fallback" || item?.status === "missing_key" || item?.status === "missing" ? "fallback" : "derived"
+    dataTone: sourceTone(item?.status)
   })).join("");
   const classification = renderClassificationEvidence(stock);
   return rows || classification ? `
@@ -1865,6 +2245,30 @@ function renderSourceStatus(stock) {
       <div class="indicator-list">${classification}${renderTrustSummary(stock)}${rows}</div>
     </article>
   ` : "";
+}
+
+function renderFilingSummary(summary) {
+  if (!summary) return "";
+  const cards = [
+    ["SEC 최근 공시", summary.sec?.latestForm || "-", summary.sec?.latestTitle || "-", summary.sec?.latestDate || "-", summary.sec?.url],
+    ["Form 4 내부자", `${summary.form4?.count || 0}건`, summary.form4?.latestTitle || "최근 내부자 거래 없음", `매수 ${summary.form4?.buyCount || 0} · 매도 ${summary.form4?.sellCount || 0}`, summary.form4?.url],
+    ["13F 기관", `${summary.institutional13f?.count || 0}건`, summary.institutional13f?.topHolder || "-", `${summary.institutional13f?.topShares || "-"} · ${summary.institutional13f?.latestDate || "-"}`, summary.institutional13f?.url]
+  ];
+  return `
+    <article class="intel-card flush">
+      <header class="intel-head compact"><h3>SEC/Form 4/13F 구조화 요약</h3><span>공시·수급</span></header>
+      <div class="filing-summary-grid">
+        ${cards.map(([label, value, body, meta, url]) => `
+          <a href="${escapeHtml(url || "#")}" target="_blank" rel="noopener">
+            <span>${escapeHtml(label)}</span>
+            <strong>${escapeHtml(value)}</strong>
+            <small>${escapeHtml(body)}</small>
+            <em>${escapeHtml(meta)}</em>
+          </a>
+        `).join("")}
+      </div>
+    </article>
+  `;
 }
 
 function renderUsInsight(stock) {
@@ -1887,6 +2291,7 @@ function renderUsInsight(stock) {
       <div class="ownership-grid">
         ${(data.ownership || []).map(renderOwnershipCard).join("")}
       </div>
+      ${renderFilingSummary(data.filingSummary)}
       ${(data.institutionalHolders || []).length ? `
         <article class="intel-card flush">
           <header class="intel-head compact"><h3>기관 13F 보유자</h3><span>${data.institutionalHolders.length}건</span></header>
@@ -1906,6 +2311,7 @@ function renderUsInsight(stock) {
       <article class="intel-card">
         <header class="intel-head"><h3>뉴스 감성분석</h3><span class="status-badge good">${escapeHtml(data.sentiment?.label || "중립")}</span></header>
         <p class="sentiment-count">긍정 ${data.sentiment?.positive || 0} · 중립 ${data.sentiment?.neutral || 0} · 부정 ${data.sentiment?.negative || 0}</p>
+        ${sentimentEvidence(data.sentiment)}
         ${sentimentMeter(data.sentiment || { positive: 0, neutral: 1, negative: 0 })}
         <p class="intel-copy">${escapeHtml(data.sentiment?.summary || `${stock.ticker} 인사이트 데이터를 준비 중입니다.`)}</p>
         ${newsList(data.sentiment?.items || [])}
@@ -2006,6 +2412,22 @@ function portfolioClientId() {
   return clientId;
 }
 
+function portfolioAccessToken() {
+  let token = localStorage.getItem(PORTFOLIO_ACCESS_TOKEN_KEY);
+  if (!token) {
+    token = globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}-${Math.random().toString(16).slice(2)}`;
+    localStorage.setItem(PORTFOLIO_ACCESS_TOKEN_KEY, token);
+  }
+  return token;
+}
+
+function portfolioCloudHeaders(extra = {}) {
+  return {
+    ...extra,
+    "x-portfolio-token": portfolioAccessToken()
+  };
+}
+
 function setPortfolioCloudStatus(message, status = "warn") {
   const el = document.querySelector("#portfolioCloudStatus");
   if (!el) return;
@@ -2021,6 +2443,33 @@ function portfolioMoney(value, holding = {}, quote = {}) {
   if (!Number.isFinite(Number(value))) return "-";
   if (portfolioCurrencySymbol(holding, quote) === "원") return `${Math.round(Number(value)).toLocaleString("ko-KR")}원`;
   return `$${money(value)}`;
+}
+
+function portfolioStopState(item) {
+  const price = Number(item?.price);
+  const stop = Number(item?.stop);
+  if (!Number.isFinite(price) || !Number.isFinite(stop) || stop <= 0) {
+    return { status: "neutral", label: "손절가 없음", distancePct: null, text: "손절가 계산 데이터가 부족합니다." };
+  }
+  const distancePct = ((price / stop) - 1) * 100;
+  if (price <= stop) {
+    return { status: "breached", label: "손절가 이탈", distancePct, text: `현재가가 손절가보다 ${Math.abs(distancePct).toFixed(2)}% 낮습니다.` };
+  }
+  if (distancePct <= 3) {
+    return { status: "near", label: "손절가 3% 이내", distancePct, text: `손절가까지 ${distancePct.toFixed(2)}% 남았습니다.` };
+  }
+  return { status: "ok", label: "정상 범위", distancePct, text: `손절가까지 ${distancePct.toFixed(2)}% 여유가 있습니다.` };
+}
+
+function portfolioStopBasisText(quote) {
+  const plan = quote?.tradePlan || {};
+  const basis = plan.stopBasis || "ATR/최근 저가";
+  const parts = [
+    `채택: ${basis}`,
+    Number.isFinite(Number(plan.atrStop)) ? `ATR ${portfolioMoney(plan.atrStop, {}, quote)}` : "",
+    Number.isFinite(Number(plan.vcpStop)) ? `20일 저가 ${portfolioMoney(plan.vcpStop, {}, quote)}` : ""
+  ].filter(Boolean);
+  return parts.join(" · ");
 }
 
 function krwMoney(value) {
@@ -2085,6 +2534,7 @@ function portfolioGroupedHeat(items) {
   const maxHeat = Math.max(...heats.map((item) => item.heat));
   return {
     label: heats.map((item) => `${item.symbol === "원" ? "KRW" : "USD"} ${item.heat.toFixed(2)}%`).join(" / "),
+    basis: `계좌 기준 ${portfolio.accountSize.toLocaleString("en-US")} · Heat = Open Risk / 계좌금액`,
     status: portfolioHeatStatus(maxHeat)
   };
 }
@@ -2151,7 +2601,10 @@ function portfolioChangeSummary(items) {
     }
     const stop = Number(item.stop);
     const price = Number(item.price);
-    if (Number.isFinite(stop) && Number.isFinite(price) && price <= stop * 1.03) {
+    const stopState = portfolioStopState(item);
+    if (stopState.status === "breached") {
+      alerts.push(`${item.holding.ticker}: 손절가 이탈`);
+    } else if (stopState.status === "near") {
       alerts.push(`${item.holding.ticker}: 손절가 3% 이내 접근`);
     }
     const previousFiling = prev.latestFiling || "";
@@ -2170,7 +2623,9 @@ function collectPortfolioAlerts(items) {
   if (groupedHeat.status === "warn") alerts.push({ ticker: null, level: "warn", text: "전체 Heat가 6% 이상입니다. 추가 매수 전 손절폭을 확인하세요." });
   for (const item of items) {
     if (!item.quote) continue;
-    if (Number(item.price) <= Number(item.stop) * 1.03) alerts.push({ ticker: item.holding.ticker, level: "risk", text: `${item.holding.ticker}: 현재가가 손절가에 가까워졌습니다.` });
+    const stopState = portfolioStopState(item);
+    if (stopState.status === "breached") alerts.push({ ticker: item.holding.ticker, level: "risk", text: `${item.holding.ticker}: 손절가를 이탈했습니다. (${stopState.text})` });
+    if (stopState.status === "near") alerts.push({ ticker: item.holding.ticker, level: "warn", text: `${item.holding.ticker}: 손절가 3% 이내입니다. (${stopState.text})` });
     if (Number(item.quote.entry) < 40) alerts.push({ ticker: item.holding.ticker, level: "warn", text: `${item.holding.ticker}: EntryScore가 주의 구간입니다.` });
     if (Number(item.quote.entry) >= 75) alerts.push({ ticker: item.holding.ticker, level: "warn", text: `${item.holding.ticker}: 강하지만 추격 위험 구간입니다.` });
     const filings = item.quote.usInsight?.filings?.items || item.quote.krInsight?.filings?.items || [];
@@ -2378,7 +2833,7 @@ async function savePortfolioCloud() {
   try {
     const response = await fetch("/api/portfolio", {
       method: "PUT",
-      headers: { "content-type": "application/json" },
+      headers: portfolioCloudHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ clientId: portfolioClientId(), portfolio })
     });
     const payload = await response.json();
@@ -2393,7 +2848,9 @@ async function loadPortfolioCloud() {
   if (!canUseApi) return setPortfolioCloudStatus("서버 연결 후 클라우드 불러오기를 사용할 수 있습니다.", "risk");
   setPortfolioCloudStatus("Supabase에서 포트폴리오를 불러오는 중입니다...", "warn");
   try {
-    const response = await fetch(`/api/portfolio?clientId=${encodeURIComponent(portfolioClientId())}`);
+    const response = await fetch(`/api/portfolio?clientId=${encodeURIComponent(portfolioClientId())}`, {
+      headers: portfolioCloudHeaders()
+    });
     const payload = await response.json();
     if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
     if (!payload.portfolio) {
@@ -2490,6 +2947,8 @@ async function renderPortfolio({ refresh = false } = {}) {
   const heatEl = document.querySelector("#portfolioHeatLabel");
   heatEl.textContent = groupedHeat.label;
   heatEl.dataset.status = groupedHeat.status;
+  const heatBasisEl = document.querySelector("#portfolioHeatBasisLabel");
+  if (heatBasisEl) heatBasisEl.textContent = groupedHeat.basis || "Heat = Open Risk / 계좌금액";
   const sectorSummary = portfolioSectorSummary(enriched);
   const sectorEl = document.querySelector("#portfolioSectorLabel");
   sectorEl.textContent = sectorSummary.label;
@@ -2506,7 +2965,7 @@ async function renderPortfolio({ refresh = false } = {}) {
     const ticker = escapeHtml(item.holding.ticker);
     const itemAlerts = alerts.filter((alert) => alert.ticker === item.holding.ticker);
     const alertCell = itemAlerts.length
-      ? itemAlerts.slice(0, 2).map((alert) => `<span class="portfolio-row-alert ${alert.level}">${escapeHtml(alert.text.replace(`${item.holding.ticker}: `, ""))}</span>`).join("")
+      ? `<div class="portfolio-alert-stack">${itemAlerts.slice(0, 2).map((alert) => `<span class="portfolio-row-alert ${alert.level}">${escapeHtml(alert.text.replace(`${item.holding.ticker}: `, ""))}</span>`).join("")}</div>`
       : `<span class="portfolio-row-alert good">정상</span>`;
     if (item.error || !item.quote) {
       return `
@@ -2515,7 +2974,7 @@ async function renderPortfolio({ refresh = false } = {}) {
           <td>${money(item.holding.shares)}</td>
           <td>${money(item.holding.avgCost)}</td>
           <td colspan="6">가격 데이터를 불러오지 못했습니다.</td>
-          <td><span class="portfolio-row-alert risk">데이터 오류</span></td>
+          <td class="portfolio-alert-cell"><span class="portfolio-row-alert risk">데이터 오류</span></td>
           <td class="portfolio-actions">
             <button class="portfolio-edit" data-ticker="${ticker}" type="button">수정</button>
             <button class="portfolio-remove" data-ticker="${ticker}" type="button">삭제</button>
@@ -2524,6 +2983,8 @@ async function renderPortfolio({ refresh = false } = {}) {
       `;
     }
     const status = portfolioHeatStatus(item.heat);
+    const stopState = portfolioStopState(item);
+    const stopBasis = portfolioStopBasisText(item.quote);
     const pnlClass = item.pnl >= 0 ? "up" : "down";
     return `
       <tr data-ticker="${ticker}">
@@ -2533,10 +2994,17 @@ async function renderPortfolio({ refresh = false } = {}) {
         <td>${portfolioMoney(item.price, item.holding, item.quote)}</td>
         <td>${portfolioMoney(item.value, item.holding, item.quote)}</td>
         <td class="${pnlClass}">${portfolioMoney(item.pnl, item.holding, item.quote)}</td>
-        <td>${portfolioMoney(item.stop, item.holding, item.quote)}</td>
-        <td class="down">${portfolioMoney(item.openRisk, item.holding, item.quote)}</td>
-        <td><span class="portfolio-heat ${status}">${item.heat.toFixed(2)}%</span></td>
-        <td>${alertCell}</td>
+        <td class="portfolio-stop-cell">
+          <strong>${portfolioMoney(item.stop, item.holding, item.quote)}</strong>
+          <small class="${stopState.status}">${escapeHtml(stopState.label)} · ${escapeHtml(stopState.text)}</small>
+          <em>${escapeHtml(stopBasis)}</em>
+        </td>
+        <td class="down">
+          ${portfolioMoney(item.openRisk, item.holding, item.quote)}
+          <small>(${portfolioMoney(item.price - item.stop, item.holding, item.quote)} × ${money(item.shares)}주)</small>
+        </td>
+        <td><span class="portfolio-heat ${status}">${item.heat.toFixed(2)}%</span><small>계좌 ${money(portfolio.accountSize)} 기준</small></td>
+        <td class="portfolio-alert-cell">${alertCell}</td>
         <td class="portfolio-actions">
           <button class="portfolio-edit" data-ticker="${ticker}" type="button">수정</button>
           <button class="portfolio-remove" data-ticker="${ticker}" type="button">삭제</button>
@@ -2593,6 +3061,9 @@ async function rescan() {
   button.disabled = true;
   button.textContent = "스캔 중";
   await loadStocks({ sampleDrift: true });
+  recordScanHistory(visibleStocks());
+  renderMarketChips();
+  renderRows();
   await loadCacheStatus();
   button.textContent = apiMode ? "완료" : "샘플 완료";
   setTimeout(() => {
@@ -2605,7 +3076,7 @@ async function runBacktest() {
   const backtestRows = document.querySelector("#backtestRows");
   backtestRows.innerHTML = `<tr><td colspan="8">백테스트를 계산하는 중입니다...</td></tr>`;
   try {
-    const response = await fetch(`/api/backtest?market=${activeMarket}&mode=long&years=3&step=5&horizon=10&mdd=20`);
+    const response = await fetch(`/api/backtest?market=${activeMarket}&limit=60&mode=long&years=5&step=5&horizon=10&mdd=20`);
     if (!response.ok) throw new Error(`API ${response.status}`);
     const payload = await response.json();
     const rows = payload.results || [];
@@ -2624,12 +3095,31 @@ async function runBacktest() {
       not_ready: "데이터 준비 중"
     }[payload.status] || payload.status || "상태 미확인";
     const calibration = payload.entryCalibration;
+    const reliability = payload.backtestReliability || {};
+    const coverage = payload.coverage || {};
+    const params = payload.params || {};
+    const testedText = `${params.mode || "recent"} · ${params.years || 5}년 · +${params.horizon || 10}일 수익률 · ${params.mddHorizon || 20}일 MDD`;
+    const samplePass = reliability.meetsSampleRule ? "표본 기준 통과" : "표본 누적 필요";
+    const interpretation = calibration
+      ? `${calibration.recommendedBand} 구간이 현재 샘플에서 우선 관찰 대상입니다. 샘플 ${calibration.samples}개, edge ${pct(calibration.edge)}, 승률 ${pct(calibration.winRate)}입니다.`
+      : "아직 추천 구간을 산출할 만큼 샘플이 충분하지 않습니다.";
     const calibrationHtml = calibration ? `
       <tr class="backtest-calibration-row">
         <td colspan="8">
           <strong>현재 추천 구간: ${escapeHtml(calibration.recommendedBand)}</strong>
           <span>샘플 ${calibration.samples}개 · edge ${pct(calibration.edge)} · 승률 ${pct(calibration.winRate)} · 신뢰도 ${escapeHtml(calibration.confidence)}</span>
           <small>${escapeHtml(calibration.note || "백테스트 결과를 계속 누적해 검증합니다.")}</small>
+        </td>
+      </tr>
+    ` : "";
+    const historyRows = (payload.backtestHistory || []).slice(0, 3);
+    const historyHtml = historyRows.length ? `
+      <tr class="backtest-history-row">
+        <td colspan="8">
+          <strong>누적 검증 기록 ${historyRows.length}회</strong>
+          ${historyRows.map((item) => `
+            <span>${escapeHtml(new Date(item.generatedAt).toLocaleString("ko-KR"))} · ${escapeHtml(item.recommendedBand || "-")} · edge ${pct(item.recommendedEdge)} · 평가시점 ${escapeHtml(String(item.coverage?.evaluatedPoints || 0))}</span>
+          `).join("")}
         </td>
       </tr>
     ` : "";
@@ -2657,11 +3147,15 @@ async function runBacktest() {
         <td>${pct(row.mdd_20d)}</td>
       </tr>
     `).join("");
-    const coverage = payload.coverage || {};
-    const params = payload.params || {};
     backtestRows.innerHTML = `
-      <tr><td colspan="8">${escapeHtml(statusText)} · ${escapeHtml(payload.source || "local")} · ${escapeHtml(params.mode || "recent")} ${escapeHtml(String(params.years || 3))}년 · 평가시점 ${escapeHtml(String(coverage.evaluatedPoints || 0))}개 · 전략 샘플 ${totalSamples}개 · Entry 구간 샘플 ${entrySamples}개</td></tr>
+      <tr class="backtest-summary-row"><td colspan="8">
+        <strong>${escapeHtml(statusText)}</strong>
+        <span>${escapeHtml(testedText)} · 평가시점 ${escapeHtml(String(coverage.evaluatedPoints || 0))}개 · 로드 ${escapeHtml(String(coverage.loaded || 0))}/${escapeHtml(String(coverage.requested || 0))}종목</span>
+        <small>${escapeHtml(interpretation)}</small>
+        <small>검증 신뢰도 ${escapeHtml(reliability.label || "확인중")} · ${escapeHtml(samplePass)} · ${escapeHtml(reliability.sampleRule || "샘플 기준 확인 필요")} · ${escapeHtml(reliability.caveat || "")}</small>
+      </td></tr>
       ${calibrationHtml}
+      ${historyHtml}
       <tr class="backtest-section-row"><td colspan="8">전략 후보 검증</td></tr>
       ${strategyHtml || `<tr><td colspan="8">전략 조건에 맞는 샘플이 아직 없습니다.</td></tr>`}
       <tr class="backtest-section-row"><td colspan="8">EntryScore 구간별 검증</td></tr>
@@ -2676,6 +3170,12 @@ async function runBacktest() {
 }
 
 stockRows.addEventListener("click", (event) => {
+  const watchButton = event.target.closest(".row-watch-toggle");
+  if (watchButton) {
+    toggleWatchlist(watchButton.dataset.ticker);
+    return;
+  }
+
   const portfolioButton = event.target.closest(".row-portfolio-add");
   if (portfolioButton) {
     const stock = stocks.find((item) => item.ticker === portfolioButton.dataset.ticker);
@@ -2730,6 +3230,10 @@ document.querySelector("#loadPortfolioCloudButton")?.addEventListener("click", l
 document.querySelector("#addPortfolioFromModal")?.addEventListener("click", () => {
   const stock = getSelectedStock();
   if (stock) fillPortfolioForm(stock);
+});
+document.querySelector("#watchButton")?.addEventListener("click", () => {
+  const stock = getSelectedStock();
+  if (stock) toggleWatchlist(stock.ticker);
 });
 
 document.querySelector("#portfolioForm")?.addEventListener("submit", async (event) => {
@@ -2791,6 +3295,14 @@ document.querySelector(".market-switch").addEventListener("click", async (event)
 });
 
 document.querySelector(".quick-filters").addEventListener("click", async (event) => {
+  const filterButton = event.target.closest("button[data-filter]");
+  if (filterButton) {
+    activeQuickFilter = filterButton.dataset.filter || "all";
+    renderMarketChips();
+    renderRows();
+    return;
+  }
+
   const button = event.target.closest("button[data-market]");
   if (!button) return;
   activeMarket = button.dataset.market;
@@ -2820,9 +3332,13 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") closeStock();
 });
 
+loadWatchlist();
+loadScanHistory();
+hydrateStaticTermHelp();
 loadPortfolio();
 loadStocks().then(() => renderPortfolio());
 loadCacheStatus();
+fetchEnrichmentStatus();
 
 
 

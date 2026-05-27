@@ -817,6 +817,23 @@ async function writeScannedStocks(items) {
   }
 }
 
+async function deleteScannedStocks(ticker = "") {
+  const cleanTicker = String(ticker || "").trim().toUpperCase();
+  const hasTicker = /^[A-Z0-9.-]{1,16}$/.test(cleanTicker);
+  if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
+    const filter = hasTicker ? `ticker=eq.${encodeURIComponent(cleanTicker)}` : "ticker=neq.__never__";
+    const result = await supabaseRest(`${SUPABASE_SCANNED_TABLE}?${filter}`, {
+      method: "DELETE",
+      headers: { prefer: "return=minimal" }
+    });
+    if (result.ok) return await readScannedStocks();
+  }
+  const items = await readScannedStocks();
+  const remaining = hasTicker ? items.filter((item) => item.ticker !== cleanTicker) : [];
+  await writeScannedStocks(remaining);
+  return remaining;
+}
+
 function mergeServerStocks(current, incoming) {
   const merged = [...(current || [])];
   for (const item of incoming || []) {
@@ -3239,9 +3256,13 @@ async function apiStocks(req, res, url) {
   json(res, 200, { items: mergedItems, errors, generatedAt: new Date().toISOString() });
 }
 
-async function apiScannedStocks(req, res) {
+async function apiScannedStocks(req, res, url) {
   if (req.method === "OPTIONS") return cors(res);
   if (req.method === "GET") return json(res, 200, { ok: true, items: await readScannedStocks() });
+  if (req.method === "DELETE") {
+    const items = await deleteScannedStocks(url.searchParams.get("ticker") || "");
+    return json(res, 200, { ok: true, items, count: items.length });
+  }
   if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" });
   const body = await readRequestJson(req);
   const items = await rememberServerScannedStocks(body.items || []);
@@ -4047,7 +4068,7 @@ export async function handleRequest(req, res) {
     if (url.pathname === "/api/cron/daily-snapshot") return apiCronDailySnapshot(req, res, url);
     if (url.pathname === "/api/backtest/history") return apiBacktestHistory(req, res);
     if (url.pathname === "/api/backtest") return apiBacktest(req, res, url);
-    if (url.pathname === "/api/scanned") return apiScannedStocks(req, res);
+    if (url.pathname === "/api/scanned") return apiScannedStocks(req, res, url);
     if (url.pathname === "/api/stocks") return apiStocks(req, res, url);
     const detail = url.pathname.match(/^\/api\/stocks\/([^/]+)$/);
     if (detail) return apiStockDetail(req, res, detail[1]);

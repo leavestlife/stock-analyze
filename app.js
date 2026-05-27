@@ -259,6 +259,32 @@ async function mergeServerScannedStocks() {
   }
 }
 
+async function clearScannedStocks() {
+  localStorage.removeItem(SCANNED_STOCKS_STORAGE_KEY);
+  searchResultTickers = new Set();
+  searchInput.value = "";
+  if (canUseApi) {
+    try {
+      await fetch("/api/scanned", { method: "DELETE" });
+    } catch {
+      // 서버 삭제가 실패해도 로컬 화면은 비워 둡니다.
+    }
+  }
+  await loadStocks();
+}
+
+function ensureClearScannedButton() {
+  if (document.querySelector("#clearScannedButton")) return;
+  const scanButton = document.querySelector("#scanButton");
+  if (!scanButton) return;
+  const button = document.createElement("button");
+  button.id = "clearScannedButton";
+  button.className = "header-action";
+  button.type = "button";
+  button.textContent = "스캔 기록 삭제";
+  scanButton.insertAdjacentElement("afterend", button);
+}
+
 function recordScanHistory(items) {
   const snapshotItems = (items || [])
     .filter((stock) => stock?.ticker && Number.isFinite(Number(stock.score)))
@@ -3209,7 +3235,9 @@ tabContent.addEventListener("click", (event) => {
 
 searchInput.addEventListener("input", renderRows);
 closeModal.addEventListener("click", closeStock);
+ensureClearScannedButton();
 document.querySelector("#scanButton").addEventListener("click", rescan);
+document.querySelector("#clearScannedButton")?.addEventListener("click", clearScannedStocks);
 document.querySelector("#backtestButton").addEventListener("click", runBacktest);
 document.querySelector("#rescanPortfolioButton")?.addEventListener("click", rescanPortfolio);
 document.querySelector("#refreshPortfolioButton")?.addEventListener("click", () => renderPortfolio({ refresh: true }));

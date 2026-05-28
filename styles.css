@@ -4295,6 +4295,127 @@ input[type="checkbox"] {
   color: var(--color-bounced-red);
 }
 
+.watchlist-starter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.watchlist-starter-chips button {
+  min-height: 26px;
+  border-radius: 999px;
+  padding: 0 8px;
+  border: 1px solid rgba(59, 158, 255, .28);
+  background: rgba(59, 158, 255, .08);
+  color: var(--color-frost);
+  font-size: 11px;
+}
+
+.trust-help-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--color-fog);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.watchlist-audit-details {
+  display: grid;
+  gap: 5px;
+}
+
+.watchlist-audit-details > span {
+  color: var(--color-fog);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.watchlist-audit-row {
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 2px 6px;
+  min-height: 42px !important;
+  padding: 7px 8px !important;
+  text-align: left !important;
+}
+
+.watchlist-audit-row b {
+  color: var(--color-pure-white);
+  font-size: 12px;
+}
+
+.watchlist-audit-row span {
+  justify-self: end;
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.watchlist-audit-row small {
+  grid-column: 1 / -1;
+  color: var(--color-fog);
+  font-size: 10px;
+}
+
+.watchlist-audit-row.good span { color: var(--color-delivered-green); }
+.watchlist-audit-row.neutral span { color: var(--color-complained-yellow); }
+.watchlist-audit-row.bad span { color: var(--color-bounced-red); }
+
+.enrichment-log {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.enrichment-log li {
+  display: grid;
+  grid-template-columns: 64px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+}
+
+.enrichment-log b {
+  color: var(--color-pure-white);
+}
+
+.enrichment-log em {
+  color: var(--color-electric-blue);
+  font-style: normal;
+  font-weight: 800;
+}
+
+.detail-trust-banner {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 14px;
+  margin: 12px 0;
+  padding: 14px 16px;
+  border: 1px solid var(--color-graphite-rail);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, .04);
+}
+
+.detail-trust-banner span,
+.detail-trust-banner small,
+.detail-trust-banner p {
+  margin: 0;
+  color: var(--color-fog);
+}
+
+.detail-trust-banner strong {
+  display: block;
+  margin: 3px 0;
+  color: var(--color-pure-white);
+  font-size: 24px;
+}
+
+.detail-trust-banner.good { border-color: rgba(58, 211, 137, .36); }
+.detail-trust-banner.neutral { border-color: rgba(255, 193, 87, .42); }
+.detail-trust-banner.bad { border-color: rgba(255, 95, 109, .42); }
+
 th {
   height: 36px;
   padding: 9px 13px;

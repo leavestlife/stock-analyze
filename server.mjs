@@ -3640,6 +3640,7 @@ function prioritizeEnrichmentQueue(tickers) {
       state: "queued",
       label: "관심 종목 우선 보강 대기",
       priority: true,
+      sourcePlan: ["price", "fmp", "alphaVantage", "sec", "finra"],
       updatedAt: new Date().toISOString()
     });
   }
@@ -3669,6 +3670,7 @@ function enqueueEnrichment(tickers, options = {}) {
     enrichmentStatus.set(ticker, {
       state: "queued",
       label: "보강 대기",
+      sourcePlan: ["price", "fmp", "alphaVantage", "sec", "finra"],
       updatedAt: new Date().toISOString()
     });
     accepted.push(ticker);
@@ -3685,6 +3687,8 @@ async function processEnrichmentQueue() {
     enrichmentStatus.set(ticker, {
       state: "running",
       label: "데이터 보강 중",
+      sourcePlan: ["price", "fmp", "alphaVantage", "sec", "finra"],
+      startedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     });
     try {
@@ -3698,6 +3702,7 @@ async function processEnrichmentQueue() {
         trust: detail.trust?.label || "보통",
         sourceStatus: detail.sourceStatus || null,
         priceRows: rows.length,
+        completedAt: new Date().toISOString(),
         updatedAt: new Date().toISOString()
       });
     } catch (error) {

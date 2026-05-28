@@ -23,6 +23,7 @@ let searchResultTickers = new Set();
 let activeQuickFilter = "all";
 let scanHistory = [];
 let scanScoreChanges = new Map();
+let watchlistAuditCache = null;
 const STOCK_LOAD_TIMEOUT_MS = 45000;
 const ENRICHMENT_POLL_MS = 8000;
 let portfolio = {
@@ -179,15 +180,18 @@ async function refreshWatchlistReliability() {
     if (!response.ok) throw new Error(`API ${response.status}`);
     const payload = await response.json();
     if (!payload.ok) throw new Error(payload.error || "audit failed");
+    watchlistAuditCache = payload;
     const needs = Array.isArray(payload.needsEnrichment) ? payload.needsEnrichment : [];
     setWatchlistStatus(
       `신뢰도 ${payload.label} · 높음 ${payload.high || 0} · 보강필요 ${needs.length}`,
       payload.label === "높음" ? "good" : needs.length ? "bad" : "neutral"
     );
+    renderWatchlistAuditDetails(payload);
     if (needs.length) {
       requestDataEnrichment(needs.map((ticker) => ({ ticker })));
     }
   } catch {
+    renderWatchlistAuditDetails();
     setWatchlistStatus("관심 종목 신뢰도 점검 실패 · 로컬 목록은 유지됩니다.", "bad");
   }
 }
@@ -253,9 +257,17 @@ function renderEnrichmentStatus(payload = {}) {
     return;
   }
   const latest = items[0];
+  const logItems = items.slice(0, 4).map((item) => `
+    <li>
+      <b>${escapeHtml(item.ticker || "-")}</b>
+      <span>${escapeHtml(item.label || item.state || "-")}</span>
+      <em>${escapeHtml(item.startedAt ? "실제 보강 중" : item.completedAt ? "보강 완료" : item.priority ? "우선 대기" : "대기")}</em>
+    </li>
+  `).join("");
   statusEl.innerHTML = `
     <strong>${payload.running || active ? "데이터 보강 중" : "자동 보강 완료"}</strong>
     <span>대기 ${payload.queued || 0} · 완료 ${done} · 실패 ${errors}${latest ? ` · 최근 ${escapeHtml(latest.ticker)} ${escapeHtml(latest.label || latest.state)}` : ""}</span>
+    ${logItems ? `<ul class="enrichment-log">${logItems}</ul>` : ""}
   `;
   statusEl.className = `enrichment-status ${errors ? "warn" : payload.running || active ? "active" : "good"}`;
 }
@@ -407,6 +419,39 @@ function setWatchlistStatus(message, tone = "neutral") {
   if (!status) return;
   status.textContent = message;
   status.dataset.tone = tone;
+}
+
+function sourceShortLabel(key) {
+  return ({
+    price: "가격",
+    fmp: "FMP",
+    alphaVantage: "Alpha",
+    dart: "DART",
+    sec: "SEC",
+    finra: "FINRA"
+  })[key] || key;
+}
+
+function renderWatchlistAuditDetails(payload = watchlistAuditCache) {
+  const box = document.querySelector("#watchlistAuditDetails");
+  if (!box) return;
+  const items = Array.isArray(payload?.items) ? payload.items.slice(0, 6) : [];
+  if (!items.length) {
+    box.innerHTML = `<span>관심 종목을 추가하면 출처별 신뢰도를 점검합니다.</span>`;
+    return;
+  }
+  box.innerHTML = items.map((item) => {
+    const label = item.trust?.label || "확인중";
+    const weak = (item.weakSources || []).slice(0, 3).map(sourceShortLabel).join(", ") || "핵심 출처 양호";
+    const tone = label === "높음" ? "good" : label === "낮음" ? "bad" : "neutral";
+    return `
+      <button class="watchlist-audit-row ${tone}" data-ticker="${escapeHtml(item.ticker)}" type="button">
+        <b>${escapeHtml(item.ticker)}</b>
+        <span>${escapeHtml(label)}</span>
+        <small>${escapeHtml(weak)}</small>
+      </button>
+    `;
+  }).join("");
 }
 
 async function fetchWatchlistStocks(tickers) {
@@ -660,7 +705,17 @@ function renderSectorRail() {
         <input id="watchlistTickerInput" type="text" inputmode="latin" autocomplete="off" placeholder="AAPL, NVDA, 005930">
         <button type="submit">추가</button>
       </form>
+      <div class="watchlist-starter-chips" aria-label="관심 종목 빠른 추가">
+        ${["AAPL", "NVDA", "GOOGL", "QQQM"].map((ticker) => `<button data-watch-ticker="${ticker}" type="button">${ticker}</button>`).join("")}
+      </div>
+      <div class="trust-help-line">
+        신뢰도 기준
+        <span class="term-help" title="높음: 가격과 핵심 재무/공시 출처 대부분 연결. 보통: 일부 대체값 또는 부분 연결. 낮음: 가격 외 핵심 출처가 부족하거나 교차검증 경고가 있음.">?</span>
+      </div>
       <small id="watchlistStatus">첫 화면은 관심 종목부터 보여줍니다.</small>
+      <div id="watchlistAuditDetails" class="watchlist-audit-details">
+        <span>관심 종목을 추가하면 출처별 신뢰도를 점검합니다.</span>
+      </div>
     </div>
     <button class="${activeSector === "all" ? "active" : ""}" data-sector="all" type="button">
       <span>전체</span>
@@ -986,6 +1041,7 @@ function renderModal() {
   document.querySelector("#calloutSub").textContent = stock.subPoint || "";
   document.querySelector("#modalScore").innerHTML = isMissingData(stock) ? `-<span>점</span>` : `${stock.score}<span>점</span>`;
   renderScoreReferenceWarning(stock);
+  renderDetailTrustBanner(stock);
   document.querySelector("#entryScore").textContent = isMissingData(stock) ? "-" : stock.entry;
   document.querySelector("#entryLabel").textContent = isMissingData(stock)
     ? "데이터 없음 · 캐시 적재 필요"
@@ -1026,6 +1082,31 @@ function renderScoreReferenceWarning(stock) {
   const text = scoreReferenceWarning(stock);
   warning.textContent = text;
   warning.classList.toggle("hidden", !text);
+}
+
+function renderDetailTrustBanner(stock) {
+  const callout = document.querySelector("#bigCallout");
+  if (!callout) return;
+  let banner = document.querySelector("#detailTrustBanner");
+  if (!banner) {
+    callout.insertAdjacentHTML("afterend", `<section id="detailTrustBanner" class="detail-trust-banner"></section>`);
+    banner = document.querySelector("#detailTrustBanner");
+  }
+  const sources = Object.entries(stock.sourceStatus || {});
+  const weak = sources
+    .filter(([, item]) => ["missing", "missing_key", "fallback", "partial"].includes(item?.status))
+    .map(([key, item]) => `${sourceShortLabel(key)} ${sourceStatusLabel(item?.status)}`)
+    .slice(0, 4);
+  const tone = trustTone(stock);
+  banner.className = `detail-trust-banner ${tone}`;
+  banner.innerHTML = `
+    <div>
+      <span>데이터 신뢰도</span>
+      <strong>${escapeHtml(stock.trust?.label || "확인중")}</strong>
+      <small>${escapeHtml(stock.trust?.note || trustCountsText(stock))}</small>
+    </div>
+    <p>${weak.length ? escapeHtml(`확인 필요: ${weak.join(" · ")}`) : "가격·핵심 출처가 양호하게 연결되어 있습니다."}</p>
+  `;
 }
 
 function classificationRow(stock) {
@@ -3483,6 +3564,16 @@ document.querySelector(".quick-filters").addEventListener("click", async (event)
 });
 
 sectorRail.addEventListener("click", (event) => {
+  const quickAdd = event.target.closest("button[data-watch-ticker]");
+  if (quickAdd) {
+    addWatchlistTickers(quickAdd.dataset.watchTicker);
+    return;
+  }
+  const auditRow = event.target.closest(".watchlist-audit-row[data-ticker]");
+  if (auditRow) {
+    openStock(auditRow.dataset.ticker);
+    return;
+  }
   const button = event.target.closest("button[data-sector]");
   if (!button) return;
   activeSector = button.dataset.sector;

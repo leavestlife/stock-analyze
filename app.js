@@ -13,7 +13,7 @@ const canUseApi = window.location?.protocol !== "file:";
 let stocks = [];
 let activeMarket = "us";
 let activeView = "scanner";
-let activeSector = "all";
+let activeSector = "__watchlist";
 let selectedTicker = "";
 let selectedTab = "canslim";
 let scanCount = 0;
@@ -38,6 +38,7 @@ const PORTFOLIO_ACCESS_TOKEN_KEY = "canslimPortfolio.accessToken.v1";
 const WATCHLIST_STORAGE_KEY = "canslimWatchlist.v1";
 const SCAN_HISTORY_STORAGE_KEY = "canslimScanHistory.v1";
 const SCANNED_STOCKS_STORAGE_KEY = "canslimScannedStocks.v1";
+const WATCHLIST_SECTOR = "__watchlist";
 let watchlist = new Set();
 let enrichmentPollTimer = null;
 let enrichmentPollCount = 0;
@@ -105,6 +106,7 @@ function escapeHtml(value) {
 
 function visibleStocks() {
   return stocks.filter((stock) => {
+    if (activeSector === WATCHLIST_SECTOR) return isWatchedTicker(stock.ticker);
     const marketMatch = activeMarket === "all"
       || stock.market === activeMarket
       || (activeMarket === "us" && stock.sector === "US ETF")
@@ -335,6 +337,59 @@ function toggleWatchlist(ticker) {
   return watchlist.has(normalized);
 }
 
+function setWatchlistStatus(message, tone = "neutral") {
+  const status = document.querySelector("#watchlistStatus");
+  if (!status) return;
+  status.textContent = message;
+  status.dataset.tone = tone;
+}
+
+async function fetchWatchlistStocks(tickers) {
+  if (!canUseApi) {
+    return tickers.map(buildAdHocTicker);
+  }
+  const settled = await Promise.allSettled(tickers.map((ticker) => fetch(`/api/stocks/${encodeURIComponent(ticker)}`).then((res) => {
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    return res.json();
+  })));
+  const incoming = settled
+    .filter((item) => item.status === "fulfilled")
+    .map((item) => normalizeApiStock(item.value));
+  if (incoming.length) {
+    incoming.forEach((stock) => searchResultTickers.add(stock.ticker));
+    stocks = mergeStockResults(stocks, incoming);
+    rememberScannedStocks(incoming);
+    requestDataEnrichment(incoming);
+  }
+  return incoming;
+}
+
+async function ensureWatchlistStocks() {
+  const missing = [...watchlist].filter((ticker) => !stocks.some((stock) => stock.ticker === ticker || String(stock.yf_symbol || "").toUpperCase() === ticker));
+  if (!missing.length) return;
+  await fetchWatchlistStocks(missing.slice(0, 20));
+}
+
+async function addWatchlistTickers(value) {
+  const tickers = parseTickerList(value);
+  if (!tickers.length) {
+    setWatchlistStatus("티커를 입력해 주세요.", "bad");
+    return;
+  }
+  tickers.forEach((ticker) => watchlist.add(ticker));
+  saveWatchlist();
+  activeSector = WATCHLIST_SECTOR;
+  activeQuickFilter = "all";
+  setWatchlistStatus(`${tickers.join(", ")} 실데이터 확인 중...`, "neutral");
+  const incoming = await fetchWatchlistStocks(tickers);
+  renderMarketChips();
+  renderRows();
+  setWatchlistStatus(
+    incoming.length ? `${incoming.map((stock) => stock.ticker).join(", ")} 추가 완료` : "추가했지만 가격 데이터를 확인하지 못했습니다.",
+    incoming.length ? "good" : "bad"
+  );
+}
+
 function updateWatchButton() {
   const button = document.querySelector("#watchButton");
   if (!button) return;
@@ -511,6 +566,7 @@ function renderQuickFilters() {
 
 function renderSectorRail() {
   if (!sectorRail) return;
+  const watchedCount = [...watchlist].length;
   const source = stocks.filter((stock) => activeMarket === "all"
     || stock.market === activeMarket
     || (activeMarket === "us" && stock.sector === "US ETF")
@@ -529,6 +585,17 @@ function renderSectorRail() {
       return b[1] - a[1];
     });
   sectorRail.innerHTML = `
+    <div class="watchlist-rail-card">
+      <button class="watchlist-sector ${activeSector === WATCHLIST_SECTOR ? "active" : ""}" data-sector="${WATCHLIST_SECTOR}" type="button">
+        <span>관심 종목</span>
+        <strong>${watchedCount}</strong>
+      </button>
+      <form id="watchlistAddForm" class="watchlist-add-form">
+        <input id="watchlistTickerInput" type="text" inputmode="latin" autocomplete="off" placeholder="AAPL, NVDA, 005930">
+        <button type="submit">추가</button>
+      </form>
+      <small id="watchlistStatus">첫 화면은 관심 종목부터 보여줍니다.</small>
+    </div>
     <button class="${activeSector === "all" ? "active" : ""}" data-sector="all" type="button">
       <span>전체</span>
       <strong>${source.length}</strong>
@@ -600,7 +667,7 @@ function renderMarketChips() {
     <span class="chip">관심 후보 <strong>${yellow + green}</strong>개</span>
     <span class="chip">내 관심 <strong>${watched}</strong>개</span>
     <span class="chip">변화 기록 <strong>${scanHistory.length}</strong>회</span>
-    <span class="chip">섹터 <strong>${activeSector === "all" ? "전체" : activeSector}</strong></span>
+    <span class="chip">섹터 <strong>${activeSector === WATCHLIST_SECTOR ? "관심 종목" : activeSector === "all" ? "전체" : activeSector}</strong></span>
   `;
   renderQuickFilters();
   renderSectorRail();
@@ -657,7 +724,10 @@ function renderRows() {
   });
 
   if (!rows.length) {
-    stockRows.innerHTML = `<tr><td colspan="13">검색 결과가 없습니다. 티커를 다시 확인해 주세요.</td></tr>`;
+    const message = activeSector === WATCHLIST_SECTOR
+      ? "관심 종목이 아직 없습니다. 왼쪽 관심 종목 입력창에 티커를 추가해 주세요."
+      : "검색 결과가 없습니다. 티커를 다시 확인해 주세요.";
+    stockRows.innerHTML = `<tr><td colspan="13">${message}</td></tr>`;
   }
 }
 
@@ -693,6 +763,7 @@ async function loadStocks({ sampleDrift = false } = {}) {
     const real = realStocks();
     const base = real ? ensureSearchTicker([...real]) : (sampleDrift ? cloneFallbackWithDrift() : ensureSearchTicker([...sampleUniverse]));
     stocks = mergeSavedScannedStocks(base);
+    await ensureWatchlistStocks();
     apiMode = Boolean(real);
     renderMarketChips();
     renderRows();
@@ -751,6 +822,7 @@ async function loadStocks({ sampleDrift = false } = {}) {
       return;
     }
   }
+  await ensureWatchlistStocks();
   renderMarketChips();
   renderRows();
   if (!query) mergeServerScannedStocks();
@@ -3350,6 +3422,16 @@ sectorRail.addEventListener("click", (event) => {
   activeSector = button.dataset.sector;
   renderMarketChips();
   renderRows();
+});
+
+sectorRail.addEventListener("submit", async (event) => {
+  const form = event.target.closest("#watchlistAddForm");
+  if (!form) return;
+  event.preventDefault();
+  const input = form.querySelector("#watchlistTickerInput");
+  const value = input?.value || "";
+  if (input) input.value = "";
+  await addWatchlistTickers(value);
 });
 
 modalBackdrop.addEventListener("click", (event) => {

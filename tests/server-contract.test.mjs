@@ -66,6 +66,41 @@ test("portfolio position math calculates current value, pnl, open risk, and heat
   assert.equal(krStock.heatStatus, "warn");
 });
 
+test("detail trade plan exposes stop calculation basis", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+  try {
+    const payload = await (await fetch(`http://127.0.0.1:${port}/api/stocks/AAPL`)).json();
+    assert.equal(typeof payload.tradePlan.stopBasis, "string");
+    assert.equal(typeof payload.tradePlan.atrStop, "number");
+    assert.equal(typeof payload.tradePlan.vcpStop, "number");
+    assert.ok(["ATR 1.8배", "20일 저가 1% 여유"].includes(payload.tradePlan.stopBasis));
+  } finally {
+    server.close();
+  }
+});
+
+test("detail payload exposes data cross checks and anomaly warnings", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+  try {
+    const stockPayload = await (await fetch(`http://127.0.0.1:${port}/api/stocks/NVDA`)).json();
+    assert.ok(stockPayload.dataCrossChecks);
+    assert.ok(Array.isArray(stockPayload.dataCrossChecks.checks));
+    assert.equal(typeof stockPayload.dataCrossChecks.warnCount, "number");
+    assert.ok(Array.isArray(stockPayload.anomalyWarnings));
+    assert.equal(typeof stockPayload.trust.issueCount, "number");
+
+    const etfPayload = await (await fetch(`http://127.0.0.1:${port}/api/stocks/VOO`)).json();
+    assert.ok(etfPayload.anomalyWarnings.some((item) => item.label === "ETF 처리"));
+    assert.ok((etfPayload.financeIndicators || []).every((item) => !["PER", "PBR", "ROE", "EPS"].includes(item.title)));
+  } finally {
+    server.close();
+  }
+});
+
 test("makeFactor returns display, normalized, bar, and contribution fields", () => {
   const factor = makeFactor({
     code: "N",
@@ -251,9 +286,15 @@ test("backtest endpoint returns real-engine contract shape", async () => {
     assert.equal(typeof payload.method, "string");
     assert.equal(typeof payload.params, "object");
     assert.equal(typeof payload.coverage, "object");
+    assert.equal(typeof payload.backtestReliability, "object");
+    assert.equal(payload.backtestReliability.lookaheadBlocked, true);
+    assert.equal(payload.backtestReliability.requiredSecurities, 10);
+    assert.equal(payload.backtestReliability.requiredEvaluatedPoints, 500);
+    assert.equal(typeof payload.backtestReliability.meetsSampleRule, "boolean");
     assert.equal(typeof payload.generatedAt, "string");
     assert.ok(Array.isArray(payload.results));
     assert.ok(Array.isArray(payload.errors));
+    assert.ok(Array.isArray(payload.backtestHistory));
 
     if (payload.results.length) {
       const hybrid = payload.results.find((row) => row.name === "V4_HYBRID");
@@ -262,6 +303,23 @@ test("backtest endpoint returns real-engine contract shape", async () => {
         assert.ok(Object.hasOwn(hybrid, key));
       }
     }
+  } finally {
+    server.close();
+  }
+});
+
+test("backtest history endpoint exposes accumulated runs", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+  try {
+    await fetch(`http://127.0.0.1:${port}/api/backtest?market=us&limit=5`);
+    const response = await fetch(`http://127.0.0.1:${port}/api/backtest/history`);
+    assert.equal(response.status, 200);
+    const payload = await response.json();
+    assert.equal(payload.ok, true);
+    assert.ok(Array.isArray(payload.items));
+    assert.equal(typeof payload.limit, "number");
   } finally {
     server.close();
   }
@@ -382,6 +440,107 @@ test("cache status endpoint exposes price cache readiness", async () => {
     assert.ok(payload.watchedSymbols.includes("SPY"));
     assert.ok(!payload.watchedSymbols.includes("TEAM"));
     assert.ok(Array.isArray(payload.missingWatchedSymbols));
+  } finally {
+    server.close();
+  }
+});
+
+test("enrichment endpoint queues scanned tickers for background cache fill", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/enrichment`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tickers: ["AAPL", "AAPL", "bad ticker"], start: false })
+    });
+    const payload = await response.json();
+    assert.equal(payload.ok, true);
+    assert.ok(Array.isArray(payload.accepted));
+    assert.equal(payload.accepted.length, 1);
+    assert.equal(payload.accepted[0], "AAPL");
+    assert.equal(typeof payload.queued, "number");
+
+    const status = await (await fetch(`http://127.0.0.1:${port}/api/enrichment`)).json();
+    assert.equal(typeof status.running, "boolean");
+    assert.equal(typeof status.queued, "number");
+    assert.ok(Array.isArray(status.items));
+    assert.ok(status.items.some((item) => item.ticker === "AAPL"));
+  } finally {
+    server.close();
+  }
+});
+
+test("enrichment endpoint prioritizes watchlist tickers", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/enrichment`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ tickers: ["AAPL", "MSFT"], priorityTickers: ["MSFT"], start: false })
+    });
+    const payload = await response.json();
+    assert.equal(payload.ok, true);
+    assert.deepEqual(payload.priority, ["MSFT"]);
+    assert.ok(payload.items.some((item) => item.ticker === "MSFT" && item.priority === true));
+  } finally {
+    server.close();
+  }
+});
+
+test("scanned endpoint persists searched stocks on the server", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  try {
+    const save = await fetch(`http://127.0.0.1:${port}/api/scanned`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ items: [{ ticker: "AAPL", company: "Apple", market: "us", score: 50 }] })
+    });
+    const saved = await save.json();
+    assert.equal(saved.ok, true);
+    assert.ok(saved.items.some((item) => item.ticker === "AAPL"));
+
+    const payload = await (await fetch(`http://127.0.0.1:${port}/api/scanned`)).json();
+    assert.equal(payload.ok, true);
+    assert.ok(payload.items.some((item) => item.ticker === "AAPL"));
+  } finally {
+    server.close();
+  }
+});
+
+test("watchlist cloud endpoint responds without crashing", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  try {
+    const token = "local-test-token-123456";
+    const save = await fetch(`http://127.0.0.1:${port}/api/watchlist`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-portfolio-token": token },
+      body: JSON.stringify({ clientId: "local-test-watchlist", tickers: ["aapl", "bad ticker", "NVDA"] })
+    });
+    const saved = await save.json();
+    assert.equal(typeof saved.ok, "boolean");
+    assert.equal(typeof saved.configured, "boolean");
+    if (saved.configured) {
+      assert.deepEqual(saved.tickers, ["AAPL", "NVDA"]);
+      const payload = await (await fetch(`http://127.0.0.1:${port}/api/watchlist?clientId=local-test-watchlist`, {
+        headers: { "x-portfolio-token": token }
+      })).json();
+      assert.equal(payload.ok, true);
+      assert.deepEqual(payload.tickers, ["AAPL", "NVDA"]);
+    } else {
+      assert.match(saved.error, /관심 종목|Supabase/);
+    }
   } finally {
     server.close();
   }

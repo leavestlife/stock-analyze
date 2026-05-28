@@ -127,6 +127,44 @@ function loadWatchlist() {
 
 function saveWatchlist() {
   localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify([...watchlist].sort()));
+  persistCloudWatchlist();
+}
+
+function watchlistCloudHeaders(extra = {}) {
+  return portfolioCloudHeaders(extra);
+}
+
+async function persistCloudWatchlist() {
+  if (!canUseApi) return;
+  try {
+    await fetch("/api/watchlist", {
+      method: "POST",
+      headers: watchlistCloudHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ clientId: portfolioClientId(), tickers: [...watchlist].sort() })
+    });
+  } catch {
+    // 로컬 관심 목록은 유지합니다.
+  }
+}
+
+async function loadCloudWatchlist() {
+  if (!canUseApi) return;
+  try {
+    const response = await fetch(`/api/watchlist?clientId=${encodeURIComponent(portfolioClientId())}`, {
+      headers: watchlistCloudHeaders()
+    });
+    if (!response.ok) throw new Error(`API ${response.status}`);
+    const payload = await response.json();
+    const incoming = Array.isArray(payload.tickers) ? payload.tickers.map((ticker) => String(ticker).toUpperCase()) : [];
+    if (!incoming.length) {
+      await persistCloudWatchlist();
+      return;
+    }
+    watchlist = new Set([...watchlist, ...incoming]);
+    localStorage.setItem(WATCHLIST_STORAGE_KEY, JSON.stringify([...watchlist].sort()));
+  } catch {
+    // 서버 저장소가 없어도 로컬 관심 목록으로 계속 진행합니다.
+  }
 }
 
 function loadScanHistory() {
@@ -224,18 +262,20 @@ function startEnrichmentPolling() {
 async function requestDataEnrichment(items) {
   if (!canUseApi) return;
   const tickers = enrichmentTickersFrom(items);
-  if (!tickers.length) return;
+  const priorityTickers = [...watchlist].slice(0, 12);
+  const orderedTickers = [...new Set([...priorityTickers, ...tickers])];
+  if (!orderedTickers.length) return;
   try {
     const response = await fetch("/api/enrichment", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ tickers })
+      body: JSON.stringify({ tickers: orderedTickers, priorityTickers })
     });
     if (!response.ok) throw new Error(`API ${response.status}`);
     renderEnrichmentStatus(await response.json());
     startEnrichmentPolling();
   } catch {
-    renderEnrichmentStatus({ items: [{ ticker: tickers[0], state: "error", label: "자동 보강 시작 실패" }] });
+    renderEnrichmentStatus({ items: [{ ticker: orderedTickers[0], state: "error", label: "자동 보강 시작 실패" }] });
   }
 }
 
@@ -3446,7 +3486,9 @@ loadWatchlist();
 loadScanHistory();
 hydrateStaticTermHelp();
 loadPortfolio();
-loadStocks().then(() => renderPortfolio());
+loadCloudWatchlist()
+  .then(() => loadStocks())
+  .then(() => renderPortfolio());
 loadCacheStatus();
 fetchEnrichmentStatus();
 

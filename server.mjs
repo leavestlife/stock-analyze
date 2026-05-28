@@ -32,6 +32,7 @@ const SUPABASE_SERVICE_ROLE_KEY = ENV.SUPABASE_SERVICE_ROLE_KEY || "";
 const SUPABASE_PORTFOLIO_TABLE = ENV.SUPABASE_PORTFOLIO_TABLE || "stocklens_portfolios";
 const SUPABASE_SNAPSHOT_TABLE = ENV.SUPABASE_SNAPSHOT_TABLE || "stocklens_analysis_snapshots";
 const SUPABASE_SCANNED_TABLE = ENV.SUPABASE_SCANNED_TABLE || "stocklens_scanned_stocks";
+const SUPABASE_WATCHLIST_TABLE = ENV.SUPABASE_WATCHLIST_TABLE || "stocklens_watchlists";
 const CRON_SECRET = ENV.CRON_SECRET || "";
 const DEFAULT_ACCOUNT_SIZE = Number(ENV.TRADING_ACCOUNT_SIZE || 10000);
 const DEFAULT_RISK_PCT = Number(ENV.TRADING_RISK_PCT || 1);
@@ -732,7 +733,7 @@ function json(res, status, payload) {
 function cors(res) {
   res.writeHead(204, {
     "access-control-allow-origin": "*",
-    "access-control-allow-methods": "GET,POST,PUT,OPTIONS",
+    "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
     "access-control-allow-headers": "content-type"
   });
   res.end();
@@ -891,6 +892,48 @@ function portfolioAuthMatches(clientId, payload, token) {
   const savedHash = payload?.cloudAuth?.tokenHash;
   if (!savedHash) return true;
   return portfolioTokenHash(clientId, token) === savedHash;
+}
+
+function cleanWatchlistTickers(tickers, limit = 80) {
+  return [...new Set((tickers || [])
+    .map((ticker) => String(ticker || "").trim().toUpperCase())
+    .filter((ticker) => /^[A-Z0-9.-]{1,16}$/.test(ticker)))]
+    .slice(0, limit);
+}
+
+async function readCloudWatchlist(clientId, token) {
+  if (!validPortfolioClientId(clientId)) return { ok: false, status: 400, error: "clientId가 올바르지 않습니다." };
+  const result = await supabaseRest(`${SUPABASE_WATCHLIST_TABLE}?client_id=eq.${encodeURIComponent(clientId)}&select=client_id,payload,updated_at&limit=1`);
+  if (!result.ok) return { ok: false, status: result.status, error: "관심 종목 저장소를 읽지 못했습니다.", configured: result.configured };
+  const row = Array.isArray(result.payload) ? result.payload[0] : null;
+  if (row?.payload && !portfolioAuthMatches(clientId, row.payload, token)) {
+    return { ok: false, status: 403, error: "관심 종목 접근 토큰이 일치하지 않습니다." };
+  }
+  return {
+    ok: true,
+    configured: true,
+    tickers: cleanWatchlistTickers(row?.payload?.tickers || []),
+    updatedAt: row?.updated_at || null
+  };
+}
+
+async function writeCloudWatchlist(clientId, tickers, token) {
+  if (!validPortfolioClientId(clientId)) return { ok: false, status: 400, error: "clientId가 올바르지 않습니다." };
+  const existing = await readCloudWatchlist(clientId, token);
+  if (!existing.ok && existing.status === 403) return existing;
+  const payload = attachPortfolioAuth(clientId, { tickers: cleanWatchlistTickers(tickers) }, token);
+  if (!payload) return { ok: false, status: 401, error: "관심 종목 접근 토큰이 필요합니다." };
+  const result = await supabaseRest(`${SUPABASE_WATCHLIST_TABLE}?on_conflict=client_id`, {
+    method: "POST",
+    headers: { prefer: "resolution=merge-duplicates,return=representation" },
+    body: [{
+      client_id: clientId,
+      payload,
+      updated_at: new Date().toISOString()
+    }]
+  });
+  if (!result.ok) return { ok: false, status: result.status, error: "관심 종목 저장에 실패했습니다.", configured: result.configured };
+  return { ok: true, configured: true, tickers: payload.tickers, updatedAt: new Date().toISOString() };
 }
 
 function clamp(value, low = 0, high = 100) {
@@ -3390,6 +3433,25 @@ async function apiPortfolio(req, res, url) {
   return json(res, 405, { error: "Method not allowed" });
 }
 
+async function apiWatchlist(req, res, url) {
+  if (req.method === "OPTIONS") return cors(res);
+  if (req.method === "GET") {
+    const result = await readCloudWatchlist(url.searchParams.get("clientId"), portfolioTokenFromRequest(req));
+    return json(res, result.status || 200, result.ok ? result : { ok: false, configured: result.configured ?? true, error: result.error });
+  }
+  if (req.method === "POST" || req.method === "PUT") {
+    const body = await readRequestJson(req);
+    const result = await writeCloudWatchlist(body.clientId, body.tickers || [], portfolioTokenFromRequest(req, body));
+    return json(res, result.status || 200, result.ok ? result : { ok: false, configured: result.configured ?? true, error: result.error });
+  }
+  if (req.method === "DELETE") {
+    const clientId = url.searchParams.get("clientId");
+    const result = await writeCloudWatchlist(clientId, [], portfolioTokenFromRequest(req));
+    return json(res, result.status || 200, result.ok ? result : { ok: false, configured: result.configured ?? true, error: result.error });
+  }
+  return json(res, 405, { error: "Method not allowed" });
+}
+
 function snapshotPayload(stock) {
   return {
     ticker: stock.ticker,
@@ -3487,6 +3549,29 @@ function cleanEnrichmentTickers(tickers, limit = ENRICHMENT_BATCH_LIMIT) {
     .slice(0, limit);
 }
 
+function prioritizeEnrichmentQueue(tickers) {
+  const priority = cleanEnrichmentTickers(tickers, ENRICHMENT_BATCH_LIMIT);
+  if (!priority.length) return [];
+  for (let index = enrichmentQueue.length - 1; index >= 0; index -= 1) {
+    if (priority.includes(enrichmentQueue[index])) enrichmentQueue.splice(index, 1);
+  }
+  enrichmentQueue.unshift(...priority.filter((ticker) => {
+    const current = enrichmentStatus.get(ticker);
+    return current?.state !== "running";
+  }));
+  for (const ticker of priority) {
+    const current = enrichmentStatus.get(ticker);
+    if (current?.state === "running") continue;
+    enrichmentStatus.set(ticker, {
+      state: "queued",
+      label: "관심 종목 우선 보강 대기",
+      priority: true,
+      updatedAt: new Date().toISOString()
+    });
+  }
+  return priority;
+}
+
 function enrichmentSnapshot(limit = 30) {
   const items = [...enrichmentStatus.entries()]
     .map(([ticker, status]) => ({ ticker, ...status }))
@@ -3558,9 +3643,12 @@ async function apiEnrichment(req, res) {
   if (req.method === "GET") return json(res, 200, enrichmentSnapshot());
   if (req.method !== "POST") return json(res, 405, { error: "Method not allowed" });
   const body = await readRequestJson(req);
-  const accepted = enqueueEnrichment(body.tickers || [], { start: body.start !== false });
+  const priority = prioritizeEnrichmentQueue(body.priorityTickers || []);
+  const accepted = enqueueEnrichment(body.tickers || [], { start: false });
+  if ((priority.length || accepted.length) && body.start !== false) setTimeout(processEnrichmentQueue, 0);
   return json(res, 200, {
     ok: true,
+    priority,
     accepted,
     ...enrichmentSnapshot()
   });
@@ -4064,6 +4152,7 @@ export async function handleRequest(req, res) {
     if (url.pathname === "/api/cache/status") return apiCacheStatus(req, res);
     if (url.pathname === "/api/enrichment") return apiEnrichment(req, res);
     if (url.pathname === "/api/portfolio") return apiPortfolio(req, res, url);
+    if (url.pathname === "/api/watchlist") return apiWatchlist(req, res, url);
     if (url.pathname === "/api/snapshots") return apiSnapshots(req, res, url);
     if (url.pathname === "/api/cron/daily-snapshot") return apiCronDailySnapshot(req, res, url);
     if (url.pathname === "/api/backtest/history") return apiBacktestHistory(req, res);

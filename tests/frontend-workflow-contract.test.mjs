@@ -39,6 +39,10 @@ test("watchlist is the first scanner view and supports direct ticker add", async
     "addWatchlistTickers",
     "ensureWatchlistStocks",
     "fetchWatchlistStocks",
+    "loadCloudWatchlist",
+    "persistCloudWatchlist",
+    "/api/watchlist",
+    "priorityTickers",
     "첫 화면은 관심 종목부터 보여줍니다"
   ]) {
     assert.ok(app.includes(needle), `watchlist-first workflow missing: ${needle}`);

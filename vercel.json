@@ -10,6 +10,7 @@
           "app.js",
           "styles.css",
           "real_data.js",
+          "docs/**",
           "data/**"
         ]
       }

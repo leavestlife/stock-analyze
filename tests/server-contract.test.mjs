@@ -546,6 +546,27 @@ test("watchlist cloud endpoint responds without crashing", async () => {
   }
 });
 
+test("watchlist audit reports reliability and queues weak tickers", async () => {
+  const server = createAppServer().listen(0, "127.0.0.1");
+  await new Promise((resolve) => server.once("listening", resolve));
+  const port = server.address().port;
+
+  try {
+    const payload = await (await fetch(`http://127.0.0.1:${port}/api/watchlist/audit?tickers=AAPL`)).json();
+    assert.equal(payload.ok, true);
+    assert.ok(["높음", "보통", "낮음", "준비중"].includes(payload.label));
+    assert.equal(typeof payload.total, "number");
+    assert.ok(Array.isArray(payload.items));
+    assert.ok(Array.isArray(payload.needsEnrichment));
+    if (payload.items.length) {
+      assert.ok(payload.items[0].trust);
+      assert.ok(payload.items[0].sourceStatus);
+    }
+  } finally {
+    server.close();
+  }
+});
+
 test("portfolio cloud endpoint responds without crashing", async () => {
   const server = createAppServer().listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));

@@ -167,6 +167,31 @@ async function loadCloudWatchlist() {
   }
 }
 
+async function refreshWatchlistReliability() {
+  if (!canUseApi || !watchlist.size) {
+    setWatchlistStatus(watchlist.size ? "관심 종목 신뢰도 점검 대기" : "첫 화면은 관심 종목부터 보여줍니다.");
+    return;
+  }
+  try {
+    const response = await fetch(`/api/watchlist/audit?clientId=${encodeURIComponent(portfolioClientId())}`, {
+      headers: watchlistCloudHeaders()
+    });
+    if (!response.ok) throw new Error(`API ${response.status}`);
+    const payload = await response.json();
+    if (!payload.ok) throw new Error(payload.error || "audit failed");
+    const needs = Array.isArray(payload.needsEnrichment) ? payload.needsEnrichment : [];
+    setWatchlistStatus(
+      `신뢰도 ${payload.label} · 높음 ${payload.high || 0} · 보강필요 ${needs.length}`,
+      payload.label === "높음" ? "good" : needs.length ? "bad" : "neutral"
+    );
+    if (needs.length) {
+      requestDataEnrichment(needs.map((ticker) => ({ ticker })));
+    }
+  } catch {
+    setWatchlistStatus("관심 종목 신뢰도 점검 실패 · 로컬 목록은 유지됩니다.", "bad");
+  }
+}
+
 function loadScanHistory() {
   try {
     const parsed = JSON.parse(localStorage.getItem(SCAN_HISTORY_STORAGE_KEY) || "[]");
@@ -424,6 +449,7 @@ async function addWatchlistTickers(value) {
   const incoming = await fetchWatchlistStocks(tickers);
   renderMarketChips();
   renderRows();
+  refreshWatchlistReliability();
   setWatchlistStatus(
     incoming.length ? `${incoming.map((stock) => stock.ticker).join(", ")} 추가 완료` : "추가했지만 가격 데이터를 확인하지 못했습니다.",
     incoming.length ? "good" : "bad"
@@ -3488,7 +3514,10 @@ hydrateStaticTermHelp();
 loadPortfolio();
 loadCloudWatchlist()
   .then(() => loadStocks())
-  .then(() => renderPortfolio());
+  .then(() => {
+    renderPortfolio();
+    refreshWatchlistReliability();
+  });
 loadCacheStatus();
 fetchEnrichmentStatus();
 

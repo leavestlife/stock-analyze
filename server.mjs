@@ -3452,6 +3452,80 @@ async function apiWatchlist(req, res, url) {
   return json(res, 405, { error: "Method not allowed" });
 }
 
+async function auditWatchlistTickers(tickers) {
+  const cleanTickers = cleanWatchlistTickers(tickers, 12);
+  const items = [];
+  const errors = [];
+  for (const ticker of cleanTickers) {
+    try {
+      const security = await resolveSecurity(ticker);
+      if (!security) throw new Error("unknown ticker");
+      const rows = await loadHistory(security);
+      const scored = await enrichListSummary(scoreSecurity(security, rows));
+      const weakSources = Object.entries(scored.sourceStatus || {})
+        .filter(([, item]) => ["missing", "missing_key", "fallback", "partial"].includes(item?.status))
+        .map(([key]) => key);
+      items.push({
+        ticker: scored.ticker,
+        company: scored.company,
+        market: scored.market,
+        price: scored.price,
+        score: scored.score,
+        entry: scored.entry,
+        trust: scored.trust,
+        sourceStatus: scored.sourceStatus,
+        weakSources,
+        needsEnrichment: scored.trust?.label !== "높음" || weakSources.length > 0
+      });
+    } catch (error) {
+      items.push({
+        ticker,
+        trust: { label: "낮음", note: "가격/출처 점검에 실패했습니다." },
+        sourceStatus: { price: sourceStatus("price", "missing") },
+        weakSources: ["price"],
+        needsEnrichment: true
+      });
+      errors.push({ ticker, error: error.message });
+    }
+  }
+  const needsEnrichment = items.filter((item) => item.needsEnrichment).map((item) => item.ticker);
+  const high = items.filter((item) => item.trust?.label === "높음").length;
+  const medium = items.filter((item) => item.trust?.label === "보통").length;
+  const low = items.filter((item) => item.trust?.label === "낮음").length;
+  const label = low ? "낮음" : medium ? "보통" : high ? "높음" : "준비중";
+  return {
+    label,
+    total: items.length,
+    high,
+    medium,
+    low,
+    needsEnrichment,
+    items,
+    errors,
+    generatedAt: new Date().toISOString()
+  };
+}
+
+async function apiWatchlistAudit(req, res, url) {
+  if (req.method === "OPTIONS") return cors(res);
+  if (req.method !== "GET") return json(res, 405, { error: "Method not allowed" });
+  let tickers = [];
+  const clientId = url.searchParams.get("clientId");
+  if (clientId) {
+    const cloud = await readCloudWatchlist(clientId, portfolioTokenFromRequest(req));
+    if (!cloud.ok) return json(res, cloud.status || 200, { ok: false, configured: cloud.configured ?? true, error: cloud.error });
+    tickers = cloud.tickers || [];
+  } else {
+    tickers = String(url.searchParams.get("tickers") || "").split(",");
+  }
+  const audit = await auditWatchlistTickers(tickers);
+  if (audit.needsEnrichment.length) {
+    prioritizeEnrichmentQueue(audit.needsEnrichment);
+    setTimeout(processEnrichmentQueue, 0);
+  }
+  return json(res, 200, { ok: true, configured: true, ...audit });
+}
+
 function snapshotPayload(stock) {
   return {
     ticker: stock.ticker,
@@ -4152,6 +4226,7 @@ export async function handleRequest(req, res) {
     if (url.pathname === "/api/cache/status") return apiCacheStatus(req, res);
     if (url.pathname === "/api/enrichment") return apiEnrichment(req, res);
     if (url.pathname === "/api/portfolio") return apiPortfolio(req, res, url);
+    if (url.pathname === "/api/watchlist/audit") return apiWatchlistAudit(req, res, url);
     if (url.pathname === "/api/watchlist") return apiWatchlist(req, res, url);
     if (url.pathname === "/api/snapshots") return apiSnapshots(req, res, url);
     if (url.pathname === "/api/cron/daily-snapshot") return apiCronDailySnapshot(req, res, url);

@@ -42,6 +42,8 @@ test("watchlist is the first scanner view and supports direct ticker add", async
     "loadCloudWatchlist",
     "persistCloudWatchlist",
     "/api/watchlist",
+    "refreshWatchlistReliability",
+    "/api/watchlist/audit",
     "priorityTickers",
     "첫 화면은 관심 종목부터 보여줍니다"
   ]) {
